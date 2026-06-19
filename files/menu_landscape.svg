@@ -1,0 +1,39 @@
+<svg viewBox="0 0 480 320" width="480" height="320" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="480" height="320" fill="#FFFFFF"/>
+
+<text x="18" y="23" font-family="DejaVu Sans, Arial, sans-serif" font-size="13" font-weight="600" fill="#5F5E5A">9:41</text>
+<rect x="440" y="14" width="22" height="11" rx="3" fill="none" stroke="#888780" stroke-width="1.3"/>
+<rect x="463" y="17" width="2" height="5" rx="1" fill="#888780"/>
+<rect x="442" y="16" width="15" height="7" rx="1.5" fill="#1D9E75"/>
+
+<text x="20" y="58" font-family="DejaVu Sans, Arial, sans-serif" font-size="27" font-weight="700" fill="#2C2C2A">Menu</text>
+<text x="21" y="80" font-family="DejaVu Sans, Arial, sans-serif" font-size="13" fill="#888780">Pilih salah satu menu</text>
+
+<rect x="16" y="96" width="220" height="196" rx="22" fill="#D85A30"/>
+<circle cx="126" cy="158" r="38" fill="#FFFFFF"/>
+<path d="M108 160 L126 140 L144 160 Z" fill="#D85A30"/>
+<rect x="113" y="160" width="26" height="20" rx="2" fill="#D85A30"/>
+<rect x="121" y="168" width="10" height="12" rx="1.5" fill="#FFFFFF"/>
+<text x="126" y="232" font-family="DejaVu Sans, Arial, sans-serif" font-size="24" font-weight="700" fill="#FFFFFF" text-anchor="middle">Home</text>
+<text x="126" y="256" font-family="DejaVu Sans, Arial, sans-serif" font-size="13" fill="#FFFFFF" fill-opacity="0.85" text-anchor="middle">Halaman utama</text>
+
+<rect x="252" y="96" width="212" height="92" rx="22" fill="#1D9E75"/>
+<circle cx="300" cy="142" r="30" fill="#FFFFFF"/>
+<g stroke="#1D9E75" stroke-width="3" stroke-linecap="round">
+<line x1="287" y1="134" x2="313" y2="134"/>
+<line x1="287" y1="142" x2="313" y2="142"/>
+<line x1="287" y1="150" x2="313" y2="150"/>
+</g>
+<circle cx="305" cy="134" r="4" fill="#1D9E75" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="293" cy="142" r="4" fill="#1D9E75" stroke="#FFFFFF" stroke-width="2"/>
+<circle cx="307" cy="150" r="4" fill="#1D9E75" stroke="#FFFFFF" stroke-width="2"/>
+<text x="344" y="150" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" font-weight="700" fill="#FFFFFF">Setting</text>
+
+<rect x="252" y="200" width="212" height="92" rx="22" fill="#378ADD"/>
+<circle cx="300" cy="246" r="30" fill="#FFFFFF"/>
+<circle cx="300" cy="234" r="3.5" fill="#378ADD"/>
+<rect x="296.5" y="241" width="7" height="18" rx="3.5" fill="#378ADD"/>
+<text x="344" y="254" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" font-weight="700" fill="#FFFFFF">Info</text>
+
+<rect x="210" y="305" width="60" height="5" rx="2.5" fill="#D3D1C7"/>
+</svg>

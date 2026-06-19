@@ -1,0 +1,1 @@
+Get-ChildItem -Path 'C:\Users\USER\AppData\Local','C:\Program Files','C:\Program Files (x86)','C:\tools' -Filter 'arduino-cli.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 10

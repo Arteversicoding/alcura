@@ -1,0 +1,16 @@
+# Konfigurasi & memori pribadi Claude Code (jangan diupload)
+.claude/
+
+# Installer / binary besar
+*.msi
+*.zip
+
+# Artefak build Arduino
+build/
+*.bin
+*.elf
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
