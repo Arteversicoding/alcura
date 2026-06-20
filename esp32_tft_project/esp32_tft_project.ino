@@ -31,6 +31,7 @@ struct __attribute__((packed)) ControlData {
   bool    lampState[5];
   uint8_t brightness;
   bool    fanState[2];
+  bool    pumpState[2];   // 2 pompa udara (board relay)
 };
 
 // ===== Live sensor data =====
@@ -63,7 +64,7 @@ bool     touchPressed = false;
 uint16_t calData[5] = {275, 3620, 264, 3532, 1};
 
 // ===== State machine =====
-enum AppState { SPLASH_SCREEN, MENU, HOME, SETTINGS, INFO, ABOUT, CHART_DETAIL, LIGHT, FAN };
+enum AppState { SPLASH_SCREEN, MENU, HOME, SETTINGS, INFO, ABOUT, CHART_DETAIL, LIGHT, FAN, PUMP };
 AppState currentState     = SPLASH_SCREEN;
 AppState previousState    = SPLASH_SCREEN;
 unsigned long splashStartTime = 0;
@@ -79,6 +80,11 @@ int  lightBrightness = 72;
 // ===== Fan page state =====
 bool fanState[2] = {true, false};
 
+// ===== Pompa udara state (2 pompa, board relay) =====
+// Default ON untuk aerasi terus-menerus. Tambahkan tombol di UI bila ingin
+// dikontrol manual, lalu set nilainya seperti fanState.
+bool pumpState[2] = {true, true};
+
 // ===== Settings: WiFi toggle =====
 bool wifiState = true;
 
@@ -88,14 +94,23 @@ bool espReady = false;
 
 void sendControl();
 
+// Signature beda antara core ESP32 v2.x dan v3.x -> dijaga dengan guard versi.
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+#else
 void onReceive(const uint8_t* mac, const uint8_t* data, int len) {
+#endif
   if (len == (int)sizeof(SensorData) && data[0] == 0) {
     memcpy(&pendingData, data, sizeof(SensorData));
     dataFresh = true;
   }
 }
 
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+void onSent(const wifi_tx_info_t*, esp_now_send_status_t) {}
+#else
 void onSent(const uint8_t*, esp_now_send_status_t) {}
+#endif
 
 void espNowInit() {
   WiFi.mode(WIFI_STA);
@@ -129,6 +144,8 @@ void sendControl() {
   ctrl.brightness = (uint8_t)lightBrightness;
   ctrl.fanState[0] = fanState[0];
   ctrl.fanState[1] = fanState[1];
+  ctrl.pumpState[0] = pumpState[0];
+  ctrl.pumpState[1] = pumpState[1];
   esp_now_send(broadcastMAC, (uint8_t*)&ctrl, sizeof(ctrl));
 }
 
@@ -228,6 +245,7 @@ void loop() {
     case CHART_DETAIL:   showChartDetail();  break;
     case LIGHT:          showLight();        break;
     case FAN:            showFan();          break;
+    case PUMP:           showPump();         break;
   }
   delay(50);
 }
@@ -322,23 +340,26 @@ void showMainMenu() {
     if (touchX >= 240 && touchY >= 90 && touchY < 292) {
       currentState = HOME; screenDrawn = false; delay(200); return;
     }
-    if (touchX < 240 && touchY >= 90 && touchY < 155) {
+    if (touchX < 240 && touchY >= 90 && touchY < 138) {
       currentState = SETTINGS; screenDrawn = false; delay(200); return;
     }
-    if (touchX < 240 && touchY >= 158 && touchY < 225) {
+    if (touchX < 240 && touchY >= 140 && touchY < 188) {
       currentState = FAN; screenDrawn = false; delay(200); return;
     }
-    if (touchX < 240 && touchY >= 228 && touchY < 295) {
+    if (touchX < 240 && touchY >= 190 && touchY < 238) {
+      currentState = PUMP; screenDrawn = false; delay(200); return;
+    }
+    if (touchX < 240 && touchY >= 240 && touchY < 290) {
       currentState = LIGHT; screenDrawn = false; delay(200); return;
     }
   }
 
   if (Serial.available()) {
     char cmd = Serial.read();
-    if (cmd == 'U' || cmd == 'u' || cmd == 'L' || cmd == 'l') menuSelection = (menuSelection - 1 + 4) % 4;
-    else if (cmd == 'D' || cmd == 'd' || cmd == 'R' || cmd == 'r') menuSelection = (menuSelection + 1) % 4;
+    if (cmd == 'U' || cmd == 'u' || cmd == 'L' || cmd == 'l') menuSelection = (menuSelection - 1 + 5) % 5;
+    else if (cmd == 'D' || cmd == 'd' || cmd == 'R' || cmd == 'r') menuSelection = (menuSelection + 1) % 5;
     else if (cmd == 'E' || cmd == 'e') {
-      AppState states[] = {HOME, SETTINGS, FAN, LIGHT};
+      AppState states[] = {HOME, SETTINGS, FAN, PUMP, LIGHT};
       currentState = states[menuSelection]; screenDrawn = false; delay(200); return;
     }
   }
@@ -362,9 +383,10 @@ void showMainMenu() {
   tft.drawString("Pilih salah satu menu", 20, 70, 2);
 
   drawHomeCard(14, 90, 220, 200, menuSelection == 0);
-  drawSettingCard(242, 90,  232, 62, menuSelection == 1);
-  drawFanCard(    242, 158, 232, 62, menuSelection == 2);
-  drawLightCard(  242, 226, 232, 62, menuSelection == 3);
+  drawSettingCard(242, 90,  232, 46, menuSelection == 1);
+  drawFanCard(    242, 140, 232, 46, menuSelection == 2);
+  drawPumpCard(   242, 190, 232, 46, menuSelection == 3);
+  drawLightCard(  242, 240, 232, 46, menuSelection == 4);
 
   tft.fillRoundRect(210, 308, 60, 5, 2, COLOR_PILL);
 
@@ -472,6 +494,27 @@ void drawFanCard(int x, int y, int w, int h, bool selected) {
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(COLOR_TEXT_WHITE);
   tft.drawString("Fan", cx + h / 2 + 4, cy, 4);
+}
+
+// Ikon pompa udara = gelembung (dipakai kartu menu & baris kontrol)
+void drawBubbleIcon(int cx, int cy, uint16_t c) {
+  tft.drawCircle(cx + 4, cy + 1, 6, c);
+  tft.drawCircle(cx - 6, cy + 4, 4, c);
+  tft.drawCircle(cx - 1, cy - 7, 3, c);
+}
+
+void drawPumpCard(int x, int y, int w, int h, bool selected) {
+  drawRoundedCard(x, y, w, h, h / 2, COLOR_CARD_SETTINGS);
+  if (selected) {
+    tft.drawRoundRect(x - 2, y - 2, w + 4, h + 4, h / 2 + 2, COLOR_TEXT_WHITE);
+    tft.drawRoundRect(x - 3, y - 3, w + 6, h + 6, h / 2 + 3, COLOR_TEXT_GRAY);
+  }
+  int cx = x + h / 2, cy = y + h / 2;
+  tft.fillCircle(cx, cy, h / 2 - 8, COLOR_TEXT_WHITE);
+  drawBubbleIcon(cx, cy, COLOR_CARD_SETTINGS);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.drawString("Pompa", cx + h / 2 + 4, cy, 4);
 }
 
 // ===== Sensor icon helpers =====
@@ -1055,6 +1098,96 @@ void showFan() {
 
   drawFanHeroCard();
   for (int i = 0; i < 2; i++) drawFanRowCard(i);
+
+  tft.fillRoundRect(210, 307, 60, 5, 2, COLOR_PILL);
+  screenDrawn = true;
+}
+
+// ==================== PUMP PAGE (real-time kontrol) ====================
+// Strukturnya sengaja dibuat identik dengan Fan page agar konsisten.
+void drawBigBubbleIcon(int cx, int cy, uint16_t c) {
+  tft.drawCircle(cx + 8, cy + 2, 12, c); tft.drawCircle(cx + 8, cy + 2, 11, c);
+  tft.drawCircle(cx - 11, cy + 8, 8, c); tft.drawCircle(cx - 11, cy + 8, 7, c);
+  tft.drawCircle(cx - 3, cy - 14, 6, c); tft.drawCircle(cx - 3, cy - 14, 5, c);
+}
+
+void drawPumpHeroCard() {
+  tft.fillRoundRect(10, 92, 460, 78, 14, COLOR_ACCENT_GREEN);
+  tft.fillCircle(65, 131, 33, COLOR_TEXT_WHITE);
+  drawBigBubbleIcon(65, 131, COLOR_ACCENT_GREEN);
+  tft.setTextDatum(ML_DATUM); tft.setTextColor(COLOR_TEXT_WHITE);
+  tft.drawString("Pompa Udara", 112, 116, 4);
+  tft.setTextColor(COLOR_LIGHT_GREEN);
+  tft.drawString("Kelola 2 pompa", 112, 148, 2);
+}
+
+void drawPumpRowCard(int idx) {
+  int ry  = 178 + idx * 60, rcy = ry + 26;
+  bool on = pumpState[idx];
+
+  tft.fillRoundRect(10, ry, 460, 52, 26, COLOR_TEXT_WHITE);
+  tft.drawRoundRect(10, ry, 460, 52, 26, COLOR_BORDER_LIGHT);
+
+  tft.fillCircle(44, rcy, 22, on ? COLOR_ACCENT_GREEN : 0xC618);
+  drawBubbleIcon(44, rcy, COLOR_TEXT_WHITE);
+
+  char name[10]; sprintf(name, "Pompa %d", idx + 1);
+  tft.setTextDatum(ML_DATUM); tft.setTextColor(COLOR_DARK_GREEN);
+  tft.drawString(name, 76, ry + 16, 2);
+  tft.setTextColor(on ? COLOR_ACCENT_GREEN : COLOR_TEXT_GRAY);
+  tft.drawString(on ? "Menyala" : "Mati", 76, ry + 37, 2);
+
+  int tx = 390, ty = ry + 10;
+  tft.fillRoundRect(tx, ty, 70, 32, 16, on ? COLOR_ACCENT_GREEN : 0xC618);
+  if (on) {
+    tft.setTextDatum(ML_DATUM); tft.setTextColor(COLOR_TEXT_WHITE);
+    tft.drawString("ON", tx + 8, ty + 16, 2);
+    tft.fillCircle(tx + 54, ty + 16, 12, COLOR_TEXT_WHITE);
+  } else {
+    tft.fillCircle(tx + 16, ty + 16, 12, COLOR_TEXT_WHITE);
+    tft.setTextDatum(MR_DATUM); tft.setTextColor(COLOR_TEXT_WHITE);
+    tft.drawString("OFF", tx + 62, ty + 16, 2);
+  }
+}
+
+void showPump() {
+  if (tft.getTouch(&touchX, &touchY, 200)) {
+    if (touchY >= 36 && touchY < 90) {
+      currentState = MENU; screenDrawn = false; delay(200); return;
+    }
+    for (int i = 0; i < 2; i++) {
+      int ry = 178 + i * 60;
+      if (touchY >= (uint16_t)ry && touchY < (uint16_t)(ry + 54)) {
+        pumpState[i] = !pumpState[i];
+        drawPumpRowCard(i);
+        sendControl();   // kirim ke board relay
+        delay(100); return;
+      }
+    }
+  }
+
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'B' || cmd == 'b') { currentState = MENU; screenDrawn = false; delay(200); return; }
+  }
+
+  if (screenDrawn) return;
+
+  tft.fillScreen(COLOR_BG_MENU);
+  tft.fillRect(0, 0, 480, 35, COLOR_TEXT_WHITE);
+  tft.drawFastHLine(0, 35, 480, COLOR_BORDER_LIGHT);
+  tft.setTextDatum(TL_DATUM); tft.setTextColor(COLOR_TEXT_BLACK);
+  tft.drawString("9:41", 15, 8, 2);
+  tft.fillRoundRect(440, 10, 30, 16, 3, COLOR_ACCENT_GREEN);
+  tft.fillRect(470, 14, 3, 8, COLOR_TEXT_GRAY);
+
+  tft.setTextDatum(TL_DATUM); tft.setTextColor(COLOR_DARK_GREEN);
+  tft.drawString("< Pompa", 15, 40, 4);
+  tft.setTextColor(COLOR_MUTED_GREEN);
+  tft.drawString("Kontrol pompa udara", 36, 68, 2);
+
+  drawPumpHeroCard();
+  for (int i = 0; i < 2; i++) drawPumpRowCard(i);
 
   tft.fillRoundRect(210, 307, 60, 5, 2, COLOR_PILL);
   screenDrawn = true;
