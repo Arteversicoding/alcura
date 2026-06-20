@@ -1,25 +1,21 @@
 /*
  * ===========================================================================
- *  BOARD 2 — RELAY  (Project Jepang / ALCURA)
+ *  BOARD RELAY — Kipas + Pompa  (Project Jepang / ALCURA)
  * ===========================================================================
- *  Tugas board ini: TERIMA perintah dari ALCURA via ESP-NOW, lalu hidup/matikan
- *  2 KIPAS + 2 POMPA UDARA lewat modul RELAY 4-CHANNEL.
+ *  Tugas: TERIMA perintah dari ALCURA via ESP-NOW, lalu hidup/matikan relay.
  *
  *  Komunikasi : ESP-NOW broadcast (FF:FF:FF:FF:FF:FF), channel 1.
  *               msgType = 1  -> ControlData (ALCURA -> board ini)
  *
  *  Board      : ESP32 DEVKIT V1 (WROOM, 30 pin)
  *
- *  WIRING RELAY 4-CHANNEL
- *    IN1 -> GPIO 19  (Kipas 1)        VCC modul -> 5V (Vin)
- *    IN2 -> GPIO 23  (Kipas 2)        GND modul -> GND ESP32
- *    IN3 -> GPIO 18  (Pompa udara 1)
- *    IN4 -> GPIO 21  (Pompa udara 2)
+ *  RELAY 4-CHANNEL  (ACTIVE-LOW: IN=LOW -> relay ON ; IN=HIGH -> relay OFF)
+ *    Kipas        -> GPIO 21   (fanState[0]  / "Kipas 1" di ALCURA)
+ *    Pompa Air    -> GPIO 22   (pumpState[0] / "Pompa 1" di ALCURA)
+ *    Pompa Udara  -> GPIO 17   (pumpState[1] / "Pompa 2" di ALCURA)
+ *    Kipas 2      -> GPIO 16   (fanState[1]) -> CADANGAN, belum dipasang
  *
- *  PENTING - polaritas relay:
- *    Mayoritas modul relay murah bersifat ACTIVE-LOW (IN diberi LOW = relay ON).
- *    Kode ini default RELAY_ACTIVE_LOW = true. Kalau ternyata logikanya kebalik
- *    (saat "OFF" malah nyala), cukup ubah jadi false di bawah.
+ *  Catatan: kalau ON/OFF terbalik, ubah RELAY_ACTIVE_LOW jadi false.
  * ===========================================================================
  */
 
@@ -31,19 +27,19 @@ struct __attribute__((packed)) ControlData {
   uint8_t msgType;        // 1
   bool    lampState[5];   // dipakai board lampu (diabaikan di sini)
   uint8_t brightness;     // dipakai board lampu (diabaikan di sini)
-  bool    fanState[2];    // <- board ini: 2 kipas
-  bool    pumpState[2];   // <- board ini: 2 pompa udara
+  bool    fanState[2];    // <- board ini: kipas
+  bool    pumpState[2];   // <- board ini: pompa air + pompa udara
 };
 
 // ===== KONFIG RELAY =====
 #define RELAY_ACTIVE_LOW  true   // true = IN LOW menyalakan relay (modul umum)
 
-#define PIN_FAN1   19
-#define PIN_FAN2   23
-#define PIN_PUMP1  18
-#define PIN_PUMP2  21
+#define PIN_KIPAS       21   // fanState[0]
+#define PIN_KIPAS2      16   // fanState[1]  (cadangan, belum dipasang)
+#define PIN_POMPA_AIR   22   // pumpState[0]
+#define PIN_POMPA_UDARA 17   // pumpState[1]
 
-const int relayPins[4] = { PIN_FAN1, PIN_FAN2, PIN_PUMP1, PIN_PUMP2 };
+const int relayPins[4] = { PIN_KIPAS, PIN_KIPAS2, PIN_POMPA_AIR, PIN_POMPA_UDARA };
 
 // ===== STATE (diupdate saat terima ControlData) =====
 volatile bool fanState[2]  = { false, false };
@@ -60,12 +56,19 @@ void relayWrite(int pin, bool on) {
   digitalWrite(pin, level ? HIGH : LOW);
 }
 
+// Init 1 relay TANPA "nyentak" saat boot: set OFF dulu, baru OUTPUT, lalu OFF lagi.
+void initRelay(int pin) {
+  relayWrite(pin, false);
+  pinMode(pin, OUTPUT);
+  relayWrite(pin, false);
+}
+
 // ===== Terapkan semua state ke hardware =====
 void applyHardware() {
-  relayWrite(PIN_FAN1,  fanState[0]);
-  relayWrite(PIN_FAN2,  fanState[1]);
-  relayWrite(PIN_PUMP1, pumpState[0]);
-  relayWrite(PIN_PUMP2, pumpState[1]);
+  relayWrite(PIN_KIPAS,       fanState[0]);
+  relayWrite(PIN_KIPAS2,      fanState[1]);
+  relayWrite(PIN_POMPA_AIR,   pumpState[0]);
+  relayWrite(PIN_POMPA_UDARA, pumpState[1]);
 }
 
 // ===== ESP-NOW callback: terima ControlData =====
@@ -105,14 +108,10 @@ void espNowInit() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== BOARD RELAY (2 kipas + 2 pompa) - Project Jepang ===");
+  Serial.println("\n=== BOARD RELAY (Kipas + Pompa Air + Pompa Udara) - Project Jepang ===");
 
-  // Set ke OFF SEBELUM jadi OUTPUT supaya relay tidak "nyentak" saat boot.
-  for (int i = 0; i < 4; i++) {
-    relayWrite(relayPins[i], false);
-    pinMode(relayPins[i], OUTPUT);
-    relayWrite(relayPins[i], false);
-  }
+  // Semua relay MATI dulu (tanpa glitch saat boot)
+  for (int i = 0; i < 4; i++) initRelay(relayPins[i]);
 
   espNowInit();
   Serial.println("Menunggu perintah dari ALCURA...");
@@ -129,6 +128,6 @@ void loop() {
 
   applyHardware();
 
-  Serial.printf("[CTRL] Kipas:%d%d  Pompa:%d%d\n",
+  Serial.printf("[CTRL] Kipas:%d (Kipas2:%d)  PompaAir:%d  PompaUdara:%d\n",
                 fanState[0], fanState[1], pumpState[0], pumpState[1]);
 }
