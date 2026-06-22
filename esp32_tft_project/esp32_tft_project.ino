@@ -94,6 +94,12 @@ bool espReady = false;
 
 void sendControl();
 
+// Forward declaration (parameter function-pointer -> bantu auto-prototype Arduino)
+void drawMenuGridCard(int x, int y, int w, int h,
+                      void (*iconFn)(int, int, uint16_t),
+                      const char* title, const char* subtitle,
+                      bool hasStatus, bool statusOn, bool selected);
+
 // Signature beda antara core ESP32 v2.x dan v3.x -> dijaga dengan guard versi.
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
 void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
@@ -168,6 +174,11 @@ void sendControl() {
 #define COLOR_PILL           0x67AD
 #define COLOR_BG_HOME_RIGHT  0xF7FE
 #define COLOR_GAUGE_TRACK    0x2C49
+
+// ===== Palet khusus halaman MENU (Control Center) =====
+#define COLOR_MENU_BG        0xEF7D   // abu-abu sangat muda (latar)
+#define COLOR_HOME_DEEP      0x1A66   // hijau tua kartu Home / ikon
+#define COLOR_MENU_RING      0x2B48   // cincin dekoratif samar di kartu Home
 
 // ===== Badge helpers untuk nilai sensor =====
 const char* badgeO2(float v)   { return v >= 20.5f ? "Optimal" : v >= 19.0f ? "Normal" : "Rendah"; }
@@ -337,20 +348,19 @@ bool touchInBackBtn(uint16_t tx, uint16_t ty, int x, int y, int w, int h) {
 // ==================== MAIN MENU ====================
 void showMainMenu() {
   if (tft.getTouch(&touchX, &touchY, 200)) {
-    if (touchX >= 240 && touchY >= 90 && touchY < 292) {
+    // touchX dipantulkan (sama seperti halaman lain) -> dx = koordinat visual
+    uint16_t dx = (touchX <= 480) ? (480 - touchX) : 0;
+
+    // Kartu Home (kiri)
+    if (dx >= 8 && dx <= 196 && touchY >= 88 && touchY < 305) {
       currentState = HOME; screenDrawn = false; delay(200); return;
     }
-    if (touchX < 240 && touchY >= 90 && touchY < 138) {
-      currentState = SETTINGS; screenDrawn = false; delay(200); return;
-    }
-    if (touchX < 240 && touchY >= 140 && touchY < 188) {
-      currentState = FAN; screenDrawn = false; delay(200); return;
-    }
-    if (touchX < 240 && touchY >= 190 && touchY < 238) {
-      currentState = PUMP; screenDrawn = false; delay(200); return;
-    }
-    if (touchX < 240 && touchY >= 240 && touchY < 290) {
-      currentState = LIGHT; screenDrawn = false; delay(200); return;
+    // Grid kanan 2x2
+    if (dx >= 197 && dx <= 472 && touchY >= 88 && touchY < 305) {
+      int col = (dx < 336) ? 0 : 1;          // 0 = kiri (Settings/Lighting), 1 = kanan (Vent/Pump)
+      int row = (touchY < 197) ? 0 : 1;      // 0 = atas, 1 = bawah
+      AppState grid[2][2] = {{SETTINGS, FAN}, {LIGHT, PUMP}};
+      currentState = grid[row][col]; screenDrawn = false; delay(200); return;
     }
   }
 
@@ -366,29 +376,51 @@ void showMainMenu() {
 
   if (menuSelection == previousMenuSelection && screenDrawn) return;
 
-  tft.fillScreen(COLOR_BG_MENU);
+  tft.fillScreen(COLOR_MENU_BG);
 
-  tft.fillRect(0, 0, 480, 35, COLOR_TEXT_WHITE);
-  tft.drawFastHLine(0, 35, 480, COLOR_BORDER_LIGHT);
+  // ===== Status bar (waktu + baterai) =====
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COLOR_TEXT_BLACK);
-  tft.drawString("9:41", 15, 8, 2);
-  tft.fillRoundRect(440, 10, 30, 16, 3, COLOR_ACCENT_GREEN);
-  tft.fillRect(470, 14, 3, 8, COLOR_TEXT_GRAY);
+  tft.drawString("9:41", 15, 10, 2);
+  tft.fillRoundRect(442, 12, 28, 14, 4, COLOR_TEXT_BLACK);
+  tft.fillRect(470, 16, 3, 6, COLOR_TEXT_BLACK);
 
+  // ===== Header =====
   tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COLOR_DARK_GREEN);
-  tft.drawString("Menu", 20, 43, 4);
-  tft.setTextColor(COLOR_MUTED_GREEN);
-  tft.drawString("Pilih salah satu menu", 20, 70, 2);
+  tft.setTextColor(COLOR_TEXT_BLACK);
+  tft.drawString("Control Center", 14, 30, 4);
+  tft.setTextColor(COLOR_TEXT_GRAY);
+  tft.drawString("Greenhouse", 16, 64, 2);
+  int gw = tft.textWidth("Greenhouse", 2);
+  tft.fillCircle(16 + gw + 8, 72, 2, COLOR_TEXT_GRAY);
+  tft.drawString("Node A1", 16 + gw + 16, 64, 2);
 
-  drawHomeCard(14, 90, 220, 200, menuSelection == 0);
-  drawSettingCard(242, 90,  232, 46, menuSelection == 1);
-  drawFanCard(    242, 140, 232, 46, menuSelection == 2);
-  drawPumpCard(   242, 190, 232, 46, menuSelection == 3);
-  drawLightCard(  242, 240, 232, 46, menuSelection == 4);
+  // ===== Pill status koneksi =====
+  bool online = (WiFi.status() == WL_CONNECTED) || hasLiveData;
+  tft.fillRoundRect(360, 40, 110, 32, 16, COLOR_LIGHT_GREEN);
+  tft.fillCircle(380, 56, 5, online ? COLOR_ACCENT_GREEN : COLOR_TEXT_GRAY);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(COLOR_HOME_DEEP);
+  tft.drawString(online ? "Online" : "Offline", 392, 56, 2);
 
-  tft.fillRoundRect(210, 308, 60, 5, 2, COLOR_PILL);
+  // ===== Kartu Home (kiri) =====
+  drawMenuHomeCard(14, 92, 178, 210, menuSelection == 0);
+
+  // ===== Grid kanan 2x2 (subtitle/badge memantulkan state asli) =====
+  int fans = (fanState[0] ? 1 : 0) + (fanState[1] ? 1 : 0);
+  char fanSub[16];   sprintf(fanSub, "%d fans active", fans);
+  char lightSub[18]; sprintf(lightSub, "Brightness %d%%", lightBrightness);
+  bool anyLamp = lampState[0] || lampState[1] || lampState[2] || lampState[3] || lampState[4];
+  bool anyPump = pumpState[0] || pumpState[1];
+
+  int cw = 130, ch = 100, rx1 = 200, rx2 = 340, ry1 = 92, ry2 = 202;
+  drawMenuGridCard(rx1, ry1, cw, ch, drawSlidersIcon, "Settings",    "Preferences",                 false, false,   menuSelection == 1);
+  drawMenuGridCard(rx2, ry1, cw, ch, drawFanIcon,     "Ventilation", fanSub,                        true,  fans > 0, menuSelection == 2);
+  drawMenuGridCard(rx1, ry2, cw, ch, drawBulbIcon,    "Lighting",    lightSub,                      true,  anyLamp,  menuSelection == 4);
+  drawMenuGridCard(rx2, ry2, cw, ch, drawBubbleIcon,  "Air Pump",    anyPump ? "Aktif" : "Standby", true,  anyPump,  menuSelection == 3);
+
+  // Home indicator
+  tft.fillRoundRect(210, 309, 60, 5, 2, COLOR_PILL);
 
   previousMenuSelection = menuSelection;
   screenDrawn = true;
@@ -438,62 +470,58 @@ void drawFanIcon(int cx, int cy, uint16_t c) {
   tft.fillCircle(cx, cy, 4, c);
 }
 
-void drawHomeCard(int x, int y, int w, int h, bool selected) {
-  drawRoundedCard(x, y, w, h, 18, COLOR_CARD_HOME);
-  if (selected) {
-    tft.drawRoundRect(x - 2, y - 2, w + 4, h + 4, 20, COLOR_TEXT_WHITE);
-    tft.drawRoundRect(x - 3, y - 3, w + 6, h + 6, 21, COLOR_TEXT_GRAY);
-  }
-  int cx = x + w / 2, cy = y + 78;
-  tft.fillCircle(cx, cy, 40, COLOR_TEXT_WHITE);
-  drawHouseIcon(cx, cy, COLOR_CARD_HOME);
+// Kartu Home besar (panel kiri Control Center)
+void drawMenuHomeCard(int x, int y, int w, int h, bool selected) {
+  drawRoundedCard(x, y, w, h, 20, COLOR_HOME_DEEP);
+  if (selected) tft.drawRoundRect(x - 2, y - 2, w + 4, h + 4, 22, COLOR_ACCENT_GREEN);
+
+  // Cincin dekoratif samar di pojok kanan atas
+  tft.drawCircle(x + w - 24, y + 46, 54, COLOR_MENU_RING);
+  tft.drawCircle(x + w - 24, y + 46, 53, COLOR_MENU_RING);
+
+  int cx = x + w / 2, cy = y + 84;
+  tft.fillCircle(cx, cy, 46, COLOR_TEXT_WHITE);
+  drawHouseIcon(cx, cy, COLOR_HOME_DEEP);
+
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(COLOR_TEXT_WHITE);
-  tft.drawString("Home", cx, y + 155, 4);
+  tft.drawString("Home", cx, y + 150, 4);
   tft.setTextColor(COLOR_LIGHT_GREEN);
-  tft.drawString("Halaman utama", cx, y + 175, 2);
+  tft.drawString("Halaman utama", cx, y + 180, 2);
 }
 
-void drawSettingCard(int x, int y, int w, int h, bool selected) {
-  drawRoundedCard(x, y, w, h, h / 2, COLOR_CARD_SETTINGS);
-  if (selected) {
-    tft.drawRoundRect(x - 2, y - 2, w + 4, h + 4, h / 2 + 2, COLOR_TEXT_WHITE);
-    tft.drawRoundRect(x - 3, y - 3, w + 6, h + 6, h / 2 + 3, COLOR_TEXT_GRAY);
-  }
-  int cx = x + h / 2, cy = y + h / 2;
-  tft.fillCircle(cx, cy, h / 2 - 8, COLOR_TEXT_WHITE);
-  drawSlidersIcon(cx, cy, COLOR_CARD_SETTINGS);
-  tft.setTextDatum(ML_DATUM);
-  tft.setTextColor(COLOR_TEXT_WHITE);
-  tft.drawString("Setting", cx + h / 2 + 4, cy, 4);
-}
+// Kartu kecil grid kanan: kotak ikon + judul + subjudul + badge status opsional.
+// iconFn = salah satu drawSlidersIcon / drawFanIcon / drawBulbIcon / drawBubbleIcon
+void drawMenuGridCard(int x, int y, int w, int h,
+                      void (*iconFn)(int, int, uint16_t),
+                      const char* title, const char* subtitle,
+                      bool hasStatus, bool statusOn, bool selected) {
+  drawRoundedCard(x, y, w, h, 16, COLOR_TEXT_WHITE);
+  if (selected) tft.drawRoundRect(x - 2, y - 2, w + 4, h + 4, 18, COLOR_ACCENT_GREEN);
 
-void drawLightCard(int x, int y, int w, int h, bool selected) {
-  drawRoundedCard(x, y, w, h, h / 2, COLOR_CARD_HOME);
-  if (selected) {
-    tft.drawRoundRect(x - 2, y - 2, w + 4, h + 4, h / 2 + 2, COLOR_TEXT_WHITE);
-    tft.drawRoundRect(x - 3, y - 3, w + 6, h + 6, h / 2 + 3, COLOR_TEXT_GRAY);
-  }
-  int cx = x + h / 2, cy = y + h / 2;
-  tft.fillCircle(cx, cy, h / 2 - 8, COLOR_TEXT_WHITE);
-  drawBulbIcon(cx, cy, COLOR_CARD_HOME);
-  tft.setTextDatum(ML_DATUM);
-  tft.setTextColor(COLOR_TEXT_WHITE);
-  tft.drawString("Light", cx + h / 2 + 4, cy, 4);
-}
+  // Kotak ikon hijau muda
+  int isz = 36, ix = x + 12, iy = y + 14;
+  tft.fillRoundRect(ix, iy, isz, isz, 11, COLOR_LIGHT_GREEN);
+  iconFn(ix + isz / 2, iy + isz / 2, COLOR_HOME_DEEP);
 
-void drawFanCard(int x, int y, int w, int h, bool selected) {
-  drawRoundedCard(x, y, w, h, h / 2, COLOR_CARD_SETTINGS);
-  if (selected) {
-    tft.drawRoundRect(x - 2, y - 2, w + 4, h + 4, h / 2 + 2, COLOR_TEXT_WHITE);
-    tft.drawRoundRect(x - 3, y - 3, w + 6, h + 6, h / 2 + 3, COLOR_TEXT_GRAY);
+  // Judul + subjudul
+  int tx = ix + isz + 10;
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COLOR_TEXT_BLACK);
+  tft.drawString(title, tx, y + 16, 2);
+  tft.setTextColor(COLOR_MUTED_GREEN);
+  tft.drawString(subtitle, tx, y + 42, 1);
+
+  // Badge status ON/OFF
+  if (hasStatus) {
+    uint16_t sc = statusOn ? COLOR_ACCENT_GREEN : COLOR_TEXT_GRAY;
+    const char* st = statusOn ? "ON" : "OFF";
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(sc);
+    tft.drawString(st, tx, y + 72, 2);
+    int sw = tft.textWidth(st, 2);
+    tft.fillCircle(tx + sw + 9, y + 72, 5, sc);
   }
-  int cx = x + h / 2, cy = y + h / 2;
-  tft.fillCircle(cx, cy, h / 2 - 8, COLOR_TEXT_WHITE);
-  drawFanIcon(cx, cy, COLOR_CARD_SETTINGS);
-  tft.setTextDatum(ML_DATUM);
-  tft.setTextColor(COLOR_TEXT_WHITE);
-  tft.drawString("Fan", cx + h / 2 + 4, cy, 4);
 }
 
 // Ikon pompa udara = gelembung (dipakai kartu menu & baris kontrol)
@@ -501,20 +529,6 @@ void drawBubbleIcon(int cx, int cy, uint16_t c) {
   tft.drawCircle(cx + 4, cy + 1, 6, c);
   tft.drawCircle(cx - 6, cy + 4, 4, c);
   tft.drawCircle(cx - 1, cy - 7, 3, c);
-}
-
-void drawPumpCard(int x, int y, int w, int h, bool selected) {
-  drawRoundedCard(x, y, w, h, h / 2, COLOR_CARD_SETTINGS);
-  if (selected) {
-    tft.drawRoundRect(x - 2, y - 2, w + 4, h + 4, h / 2 + 2, COLOR_TEXT_WHITE);
-    tft.drawRoundRect(x - 3, y - 3, w + 6, h + 6, h / 2 + 3, COLOR_TEXT_GRAY);
-  }
-  int cx = x + h / 2, cy = y + h / 2;
-  tft.fillCircle(cx, cy, h / 2 - 8, COLOR_TEXT_WHITE);
-  drawBubbleIcon(cx, cy, COLOR_CARD_SETTINGS);
-  tft.setTextDatum(ML_DATUM);
-  tft.setTextColor(COLOR_TEXT_WHITE);
-  tft.drawString("Pompa", cx + h / 2 + 4, cy, 4);
 }
 
 // ===== Sensor icon helpers =====
