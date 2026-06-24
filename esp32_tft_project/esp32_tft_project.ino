@@ -17,13 +17,35 @@
 #include <SPI.h>
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+// Channel tetap untuk ESP-NOW (fallback bila WiFi belum konek).
+#define ESPNOW_CHANNEL 1
+
+// Semua board (ALCURA, sensor, relay, lampu) login hotspot SAMA ini -> otomatis
+// se-channel -> ESP-NOW saling nyambung & Firebase jalan tanpa atur channel manual.
+const char* WIFI_SSID = "Alcura";        // <- nama hotspot HP (samakan persis)
+const char* WIFI_PASS = "234alcura156";  // <- password hotspot HP
+
+// Firebase RTDB: ALCURA menulis status on/off (kipas/pompa/lampu) ke /control.json.
+// (Data sensor ditulis board sensor ke /sensor.json.) Teman ambil dua node ini utk web.
+const char* FB_HOST = "alcura-id-default-rtdb.asia-southeast1.firebasedatabase.app";
+const char* FB_CTRL_PATH = "/control.json";
 
 TFT_eSPI tft = TFT_eSPI();
 
-// ===== STRUCT ESP-NOW (identik dengan sender — urutan field jangan diubah) =====
+// ===== STRUCT ESP-NOW (identik byte-for-byte dengan board sensor) =====
+// 13 nilai sensor = 13 kartu/grafik. Urutan field JANGAN diubah.
 struct __attribute__((packed)) SensorData {
   uint8_t msgType;
-  float   o2, pm25, pm10, hcho, voc, humidity, doValue, suhuAir, turbidity, aqi;
+  // Water Quality (chart 1-5, tema biru)
+  float waterPH, tds, waterTemp, waterLevel, turbidity;
+  // Air & Climate (chart 6-8, tema hijau)
+  float uvIndex, airTemp, humidity;
+  // Gas (chart 9-13, tema amber)
+  float gasH2, gasCH4, gasCO, gasCO2, gasO2;
 };
 
 struct __attribute__((packed)) ControlData {
@@ -34,26 +56,32 @@ struct __attribute__((packed)) ControlData {
   bool    pumpState[2];   // 2 pompa udara (board relay)
 };
 
-// ===== Live sensor data =====
-SensorData liveData    = {0, 21.0f, 8.0f, 25.0f, 0.03f, 58.0f, 52.0f, 11.2f, 27.0f, 4.1f, 1.0f};
+// ===== Live sensor data ===== (default wajar sebelum paket pertama tiba)
+SensorData liveData = {0,
+  7.2f, 250.0f, 27.0f, 12.0f, 3.0f,   // water: pH, TDS, waterTemp, level, turbidity
+  2.0f, 28.0f, 52.0f,                 // air: uvIndex, airTemp, humidity
+  400.0f, 450.0f, 350.0f, 600.0f, 800.0f}; // gas: H2, CH4, CO, CO2, O2
 SensorData pendingData;
 volatile bool dataFresh    = false;
 bool          hasLiveData  = false; // true setelah paket ESP-NOW pertama
 
-// ===== Chart ring buffer — 12 titik per sensor (index 1–9) =====
+// ===== Chart ring buffer — 12 titik per sensor (index 1–13) =====
 #define CHART_POINTS 12
-float chartBuf[10][CHART_POINTS];
+#define CHART_COUNT  13
+float chartBuf[CHART_COUNT + 1][CHART_POINTS];
 
-// Default chart init (sesuai nilai awal liveData agar chart terlihat wajar sebelum data tiba)
+// Default chart init (urut index 1..13 sesuai chartSensor)
 void initChartBufs() {
-  float def[10] = {0, 11.2f, 27.0f, 4.1f, 21.0f, 8.0f, 25.0f, 0.03f, 58.0f, 52.0f};
-  for (int s = 1; s <= 9; s++)
+  float def[CHART_COUNT + 1] = {0,
+    7.2f, 250.0f, 27.0f, 12.0f, 3.0f, 2.0f, 28.0f, 52.0f,
+    400.0f, 450.0f, 350.0f, 600.0f, 800.0f};
+  for (int s = 1; s <= CHART_COUNT; s++)
     for (int i = 0; i < CHART_POINTS; i++) chartBuf[s][i] = def[s];
 }
 
 // Push nilai baru ke buffer (geser kiri, tambah di akhir)
 void pushChart(int s, float val) {
-  if (s < 1 || s > 9) return;
+  if (s < 1 || s > CHART_COUNT) return;
   for (int i = 0; i < CHART_POINTS - 1; i++) chartBuf[s][i] = chartBuf[s][i + 1];
   chartBuf[s][CHART_POINTS - 1] = val;
 }
@@ -72,6 +100,17 @@ int menuSelection         = 0;
 int chartSensor           = 0;
 int previousMenuSelection = -1;
 bool screenDrawn          = false;
+
+// Firebase /control: tandai perlu tulis ulang + waktu tulis terakhir (heartbeat)
+bool          controlDirty     = true;
+unsigned long lastCtrlPush     = 0;
+unsigned long lastCtrlChange   = 0;   // waktu toggle/slider terakhir (utk debounce Firebase)
+unsigned long lastCtrlBroadcast= 0;   // waktu resend ESP-NOW terakhir (heartbeat kontrol)
+
+// HOME: true = cukup update angka kotak yg berubah (tanpa wipe layar -> anti-kedip)
+bool          homeNeedsValueUpdate = false;
+// CHART_DETAIL: true = cukup update angka+grafik (tanpa gambar ulang seluruh halaman)
+bool          chartNeedsUpdate = false;
 
 // ===== Light page state =====
 bool lampState[5]    = {true, true, false, true, false};
@@ -93,6 +132,7 @@ uint8_t broadcastMAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 bool espReady = false;
 
 void sendControl();
+void sendControlEspNow();
 
 // Forward declaration (parameter function-pointer -> bantu auto-prototype Arduino)
 void drawMenuGridCard(int x, int y, int w, int h,
@@ -118,10 +158,22 @@ void onSent(const wifi_tx_info_t*, esp_now_send_status_t) {}
 void onSent(const uint8_t*, esp_now_send_status_t) {}
 #endif
 
+// Kunci radio ke channel ESP-NOW supaya TX/RX tidak ikut pindah channel WiFi.
+// Tanpa ini, paket kontrol sering meleset = toggle terasa delay / kadang gagal.
+void lockEspNowChannel() {
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+}
+
 void espNowInit() {
+  // Login hotspot "Alcura" -> channel radio ALCURA ikut hotspot, sama dgn semua
+  // board lain. ESP-NOW (peer.channel=0) otomatis nyambung tanpa atur channel.
   WiFi.mode(WIFI_STA);
-  // Mulai koneksi ke AP "alcura"
-  WiFi.begin("alcura", "234alcura156");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // MATIKAN WiFi modem-sleep biar TX/RX ESP-NOW tidak ke-drop saat radio "tidur".
+  // Ini kunci kontrol terasa real-time & tidak "kadang gagal on/off".
+  WiFi.setSleep(false);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW GAGAL init!");
@@ -132,17 +184,19 @@ void espNowInit() {
 
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, broadcastMAC, 6);
-  peer.channel = 1;
+  peer.channel = 0;            // 0 = ikut channel WiFi sekarang
   peer.ifidx   = WIFI_IF_STA;
   peer.encrypt  = false;
   if (esp_now_add_peer(&peer) == ESP_OK) {
     espReady = true;
-    Serial.println("ESP-NOW siap → broadcast channel 1");
+    Serial.println("ESP-NOW siap -> broadcast (ikut channel hotspot)");
   }
   Serial.printf("MAC ALCURA: %s\n", WiFi.macAddress().c_str());
 }
 
-void sendControl() {
+// Broadcast status kontrol via ESP-NOW SAJA (tanpa Firebase) -> instan, jalur utama.
+// Dipanggil saat user menekan/menggeser DAN sebagai heartbeat tiap 1 dtk di loop.
+void sendControlEspNow() {
   if (!espReady) return;
   ControlData ctrl;
   ctrl.msgType = 1;
@@ -152,7 +206,47 @@ void sendControl() {
   ctrl.fanState[1] = fanState[1];
   ctrl.pumpState[0] = pumpState[0];
   ctrl.pumpState[1] = pumpState[1];
+  // Kirim 2x: broadcast bisa drop sesekali; kirim ganda murah & memastikan sampai.
   esp_now_send(broadcastMAC, (uint8_t*)&ctrl, sizeof(ctrl));
+  esp_now_send(broadcastMAC, (uint8_t*)&ctrl, sizeof(ctrl));
+}
+
+// Dipanggil tiap aksi user (toggle lampu/kipas/pompa, geser brightness).
+void sendControl() {
+  sendControlEspNow();          // kontrol langsung sampai (tak nunggu Firebase)
+  controlDirty   = true;        // tandai utk ditulis ke Firebase (di-debounce di loop)
+  lastCtrlChange = millis();    // reset timer "diam" utk debounce HTTPS
+}
+
+// Tulis status on/off (kipas/pompa/lampu + brightness) ke Firebase /control.json.
+// Dipanggil saat ada perubahan & heartbeat berkala. Teman ambil node ini utk web.
+int fbCtrlCode = 0;
+void pushControlFirebase() {
+  if (WiFi.status() != WL_CONNECTED) { fbCtrlCode = -1; return; }
+
+  char body[400];
+  snprintf(body, sizeof(body),
+    "{"
+    "\"lamp\":{\"l1\":%s,\"l2\":%s,\"l3\":%s,\"l4\":%s,\"l5\":%s,\"brightness\":%d},"
+    "\"fan\":{\"fan1\":%s,\"fan2\":%s},"
+    "\"pump\":{\"pump1\":%s,\"pump2\":%s},"
+    "\"uptime\":%lu"
+    "}",
+    lampState[0]?"true":"false", lampState[1]?"true":"false", lampState[2]?"true":"false",
+    lampState[3]?"true":"false", lampState[4]?"true":"false", lightBrightness,
+    fanState[0]?"true":"false", fanState[1]?"true":"false",
+    pumpState[0]?"true":"false", pumpState[1]?"true":"false",
+    millis() / 1000UL);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  String url = String("https://") + FB_HOST + FB_CTRL_PATH;
+  if (https.begin(client, url)) {
+    https.addHeader("Content-Type", "application/json");
+    fbCtrlCode = https.PUT((uint8_t*)body, strlen(body));
+    https.end();
+  } else fbCtrlCode = -2;
 }
 
 // ===== PALET WARNA HIJAU MEWAH =====
@@ -180,16 +274,23 @@ void sendControl() {
 #define COLOR_HOME_DEEP      0x1A66   // hijau tua kartu Home / ikon
 #define COLOR_MENU_RING      0x2B48   // cincin dekoratif samar di kartu Home
 
-// ===== Badge helpers untuk nilai sensor =====
-const char* badgeO2(float v)   { return v >= 20.5f ? "Optimal" : v >= 19.0f ? "Normal" : "Rendah"; }
-const char* badgePM25(float v) { return v <= 12.0f ? "Baik" : v <= 35.0f ? "Sedang" : "Buruk"; }
-const char* badgePM10(float v) { return v <= 54.0f ? "Baik" : v <= 100.0f ? "Sedang" : "Buruk"; }
-const char* badgeHCHO(float v) { return v <= 0.04f ? "Aman" : v <= 0.08f ? "Waspada" : "Bahaya"; }
-const char* badgeVOC(float v)  { return v <= 65.0f ? "Baik" : v <= 220.0f ? "Sedang" : "Buruk"; }
-const char* badgeHum(float v)  { return (v >= 40 && v <= 60) ? "Ideal" : v < 40 ? "Kering" : "Lembap"; }
-const char* badgeDO(float v)   { return v >= 8.0f ? "Baik" : v >= 5.0f ? "Cukup" : "Rendah"; }
-const char* badgeTemp(float v) { return (v >= 24 && v <= 30) ? "Normal" : v < 24 ? "Dingin" : "Panas"; }
-const char* badgeTurb(float v) { return v <= 4.0f ? "Jernih" : v <= 8.0f ? "Sedang" : "Keruh"; }
+// Palet tile Home per-grup (water=biru, air=hijau, gas=amber)
+#define TILE_WATER_BG  0xDF5F   // light blue
+#define TILE_WATER_FG  0x19CD   // dark blue
+#define TILE_AIR_BG    0xCEFF   // light green
+#define TILE_AIR_FG    0x1684   // dark green
+#define TILE_GAS_BG    0xFF10   // light amber
+#define TILE_GAS_FG    0xCC40   // dark amber
+
+// ===== Badge helpers (English) per sensor =====
+const char* badgePH(float v)   { return v < 6.5f ? "Acidic" : v <= 8.5f ? "Optimal" : "Alkaline"; }
+const char* badgeTDS(float v)  { return v < 300 ? "Fresh" : v < 600 ? "Fair" : "High"; }
+const char* badgeTemp(float v) { return (v >= 24 && v <= 30) ? "Normal" : v < 24 ? "Cold" : "Hot"; }
+const char* badgeLevel(float v){ return v < 5 ? "Full" : v < 15 ? "Normal" : "Low"; }
+const char* badgeTurb(float v) { return v <= 5.0f ? "Clear" : v <= 15.0f ? "Cloudy" : "Turbid"; }
+const char* badgeUV(float v)   { return v <= 2 ? "Low" : v <= 5 ? "Moderate" : v <= 7 ? "High" : "Extreme"; }
+const char* badgeHum(float v)  { return (v >= 40 && v <= 60) ? "Ideal" : v < 40 ? "Dry" : "Humid"; }
+const char* badgeGas(float v)  { return v < 1000 ? "Safe" : v < 2500 ? "Warning" : "Hazard"; }
 
 // Format float ke string
 void fmtVal(char* buf, float v, uint8_t dec) { dtostrf(v, -1, dec, buf); }
@@ -221,21 +322,31 @@ void loop() {
   // Proses data ESP-NOW yang masuk (di luar ISR/callback context)
   if (dataFresh) {
     dataFresh = false;
+    bool wasLive = hasLiveData;
     memcpy(&liveData, &pendingData, sizeof(SensorData));
     hasLiveData = true;
-    // Push ke ring buffer setiap sensor
-    pushChart(4, liveData.o2);
-    pushChart(5, liveData.pm25);
-    pushChart(6, liveData.pm10);
-    pushChart(7, liveData.hcho);
-    pushChart(8, liveData.voc);
-    pushChart(9, liveData.humidity);
-    pushChart(1, liveData.doValue);
-    pushChart(2, liveData.suhuAir);
-    pushChart(3, liveData.turbidity);
-    // Paksa redraw halaman yang menampilkan data live
-    if (currentState == HOME || currentState == CHART_DETAIL) {
-      screenDrawn = false;
+    // Push ke ring buffer setiap sensor (1-13)
+    pushChart(1,  liveData.waterPH);
+    pushChart(2,  liveData.tds);
+    pushChart(3,  liveData.waterTemp);
+    pushChart(4,  liveData.waterLevel);
+    pushChart(5,  liveData.turbidity);
+    pushChart(6,  liveData.uvIndex);
+    pushChart(7,  liveData.airTemp);
+    pushChart(8,  liveData.humidity);
+    pushChart(9,  liveData.gasH2);
+    pushChart(10, liveData.gasCH4);
+    pushChart(11, liveData.gasCO);
+    pushChart(12, liveData.gasCO2);
+    pushChart(13, liveData.gasO2);
+    // Paksa redraw HANYA bagian yang perlu (anti-kedip):
+    //  - HOME: paket pertama -> full draw (munculkan "Live"); berikutnya update angka saja.
+    //  - CHART_DETAIL: gambar ulang grafik.
+    if (currentState == HOME) {
+      if (!wasLive) screenDrawn = false;
+      else          homeNeedsValueUpdate = true;
+    } else if (currentState == CHART_DETAIL) {
+      chartNeedsUpdate = true;
     }
   }
 
@@ -258,6 +369,24 @@ void loop() {
     case FAN:            showFan();          break;
     case PUMP:           showPump();         break;
   }
+
+  // HEARTBEAT ESP-NOW tiap 1 dtk: kirim ulang status kontrol supaya board kontrol
+  // tetap sinkron walau ada paket toggle yang drop (anti "kadang ga on/off").
+  if (millis() - lastCtrlBroadcast >= 1000UL) {
+    lastCtrlBroadcast = millis();
+    sendControlEspNow();
+  }
+
+  // Firebase /control DEBOUNCED: HTTPS itu blocking (bisa ~1-2 dtk) -> kalau ditulis
+  // tiap klik, layar nge-freeze & touch ketelan. Tulis HANYA setelah user berhenti
+  // ~700ms, atau heartbeat tiap 10 dtk. Kontrol real-time tetap jalan via ESP-NOW.
+  bool ctrlQuiet = millis() - lastCtrlChange >= 700UL;
+  if ((controlDirty && ctrlQuiet) || millis() - lastCtrlPush >= 10000UL) {
+    controlDirty = false;
+    lastCtrlPush = millis();
+    pushControlFirebase();
+  }
+
   delay(50);
 }
 
@@ -621,23 +750,67 @@ void drawCultureCard(int x, int y, int w, int h,
   tft.drawString(unit, x + 8 + vw, y+48, 1);
 }
 
+// Tile sensor kompak dipecah 3 bagian supaya bisa update SEBAGIAN (anti-kedip):
+//  - tileCardStatic : kartu + border + strip + NAMA  (digambar SEKALI)
+//  - tileValue      : hapus area angka lalu tulis angka+satuan (hanya saat angka berubah)
+//  - tileBadge      : hapus area badge lalu tulis badge      (hanya saat status berubah)
+void tileCardStatic(int x, int y, int w, int h, const char* name, uint16_t fg) {
+  tft.fillRoundRect(x, y, w, h, 8, COLOR_TEXT_WHITE);
+  tft.drawRoundRect(x, y, w, h, 8, COLOR_BORDER_LIGHT);
+  tft.fillRoundRect(x, y + 6, 4, h - 12, 2, fg);     // strip aksen kiri
+  tft.setTextDatum(TL_DATUM); tft.setTextColor(COLOR_MUTED_GREEN);
+  tft.drawString(name, x + 10, y + 5, 1);
+}
+void tileValue(int x, int y, int w, const char* val, const char* unit) {
+  tft.fillRect(x + 6, y + 18, w - 10, 17, COLOR_TEXT_WHITE);   // hapus HANYA area angka
+  tft.setTextDatum(TL_DATUM); tft.setTextColor(COLOR_DARK_GREEN);
+  tft.drawString(val, x + 10, y + 19, 2);
+  int vw = tft.textWidth(val, 2);
+  tft.setTextColor(COLOR_TEXT_GRAY);
+  tft.drawString(unit, x + 13 + vw, y + 24, 1);
+}
+void tileBadge(int x, int y, int w, const char* badge, uint16_t bg, uint16_t fg) {
+  tft.fillRect(x + w - 66, y + 3, 62, 15, COLOR_TEXT_WHITE);   // hapus HANYA area badge
+  int bl = strlen(badge), bw = bl * 6 + 8, bx = x + w - bw - 4;
+  tft.fillRoundRect(bx, y + 4, bw, 13, 6, bg);
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(fg);
+  tft.drawString(badge, bx + bw / 2, y + 11, 1);
+}
+
+// Header seksi kecil (titik berwarna + judul + jumlah)
+void drawSectionHead(int y, const char* title, const char* count, uint16_t dot, uint16_t txt) {
+  tft.fillCircle(13, y, 4, dot);
+  tft.setTextDatum(ML_DATUM); tft.setTextColor(COLOR_DARK_GREEN);
+  tft.drawString(title, 22, y, 2);
+  tft.setTextDatum(MR_DATUM); tft.setTextColor(txt);
+  tft.drawString(count, 474, y, 1);
+}
+
 // ==================== HOME PAGE (real-time) ====================
+// Layout 3 kolom (x=6/166/326, w=148). chartSensor 1-13.
+// Posisi 13 kotak (urut chartSensor 1..13). Tinggi kotak = 36.
+//  Water row1 y=78 | Water row2 y=116 | Air y=168 | Gas row1 y=220 | Gas row2 y=258
+static const int HOME_TX[13] = {6,166,326, 6,166, 6,166,326, 6,166,326, 6,166};
+static const int HOME_TY[13] = {78,78,78, 116,116, 168,168,168, 220,220,220, 258,258};
+#define HOME_TW 148
+#define HOME_TH 36
+
 void showHome() {
   if (tft.getTouch(&touchX, &touchY, 200)) {
     uint16_t dx = (touchX <= 480) ? (480 - touchX) : 0;
+    int col = (dx < 160) ? 0 : (dx < 320) ? 1 : 2;
 
     if (touchY < 62) { currentState = MENU; screenDrawn = false; delay(200); return; }
 
-    if (touchY >= 80 && touchY < 208) {
-      int row = (touchY < 142) ? 0 : 1;
-      int col = (dx < 165) ? 0 : (dx < 322) ? 1 : 2;
-      const int airMap[2][3] = {{4, 5, 6}, {7, 8, 9}};
-      chartSensor = airMap[row][col];
-      currentState = CHART_DETAIL; screenDrawn = false; delay(200); return;
-    }
-    if (touchY >= 228 && touchY < 298) {
-      int col = (dx < 165) ? 0 : (dx < 322) ? 1 : 2;
-      chartSensor = col + 1;
+    int sel = 0;
+    if      (touchY >= 78  && touchY < 114) sel = 1 + col;            // Water row1
+    else if (touchY >= 116 && touchY < 152 && col < 2) sel = 4 + col; // Water row2
+    else if (touchY >= 168 && touchY < 204) sel = 6 + col;            // Air
+    else if (touchY >= 220 && touchY < 256) sel = 9 + col;            // Gas row1
+    else if (touchY >= 258 && touchY < 294 && col < 2) sel = 12 + col;// Gas row2
+
+    if (sel >= 1 && sel <= CHART_COUNT) {
+      chartSensor = sel;
       currentState = CHART_DETAIL; screenDrawn = false; delay(200); return;
     }
   }
@@ -647,77 +820,74 @@ void showHome() {
     if (cmd == 'B' || cmd == 'b') { currentState = MENU; screenDrawn = false; delay(200); return; }
   }
 
-  if (screenDrawn) return;
+  bool fullDraw = !screenDrawn;
+  if (!fullDraw && !homeNeedsValueUpdate) return;   // tidak ada yg perlu digambar
+  homeNeedsValueUpdate = false;
 
-  tft.fillScreen(COLOR_BG_MENU);
+  // Susun 13 kotak urut chartSensor 1..13
+  float vv[13] = {
+    liveData.waterPH, liveData.tds, liveData.waterTemp, liveData.waterLevel, liveData.turbidity,
+    liveData.uvIndex, liveData.airTemp, liveData.humidity,
+    liveData.gasH2, liveData.gasCH4, liveData.gasCO, liveData.gasCO2, liveData.gasO2 };
+  const uint8_t dd[13] = {2,0,1,1,1, 0,1,0, 0,0,0,0,0};
+  const char* nn[13] = {"pH Level","TDS","Water Temp","Water Level","Turbidity",
+                        "UV Index","Air Temp","Humidity","H2","CH4","CO","CO2","O2"};
+  const char* uu[13] = {"pH","ppm","C","cm","NTU","idx","C","%","ppm","ppm","ppm","ppm","ppm"};
+  const char* bb[13] = {
+    badgePH(vv[0]), badgeTDS(vv[1]), badgeTemp(vv[2]), badgeLevel(vv[3]), badgeTurb(vv[4]),
+    badgeUV(vv[5]), badgeTemp(vv[6]), badgeHum(vv[7]),
+    badgeGas(vv[8]), badgeGas(vv[9]), badgeGas(vv[10]), badgeGas(vv[11]), badgeGas(vv[12]) };
+  static char prevVal[13][14], prevBadge[13][14];
 
-  // Status bar
-  tft.fillRect(0, 0, 480, 30, COLOR_TEXT_WHITE);
-  tft.drawFastHLine(0, 30, 480, COLOR_BORDER_LIGHT);
-  tft.setTextDatum(TL_DATUM); tft.setTextColor(COLOR_TEXT_BLACK);
-  tft.drawString("9:41", 10, 8, 2);
-  tft.fillRoundRect(440, 8, 30, 14, 3, COLOR_ACCENT_GREEN);
-  tft.fillRect(470, 11, 3, 8, COLOR_TEXT_GRAY);
+  // Bagian STATIS (status bar, header, judul seksi, NAMA kotak) digambar SEKALI -> tak kedip
+  if (fullDraw) {
+    tft.fillScreen(COLOR_BG_MENU);
 
-  // Header
-  tft.setTextDatum(TL_DATUM); tft.setTextColor(COLOR_DARK_GREEN);
-  tft.drawString("< Sensor Readings", 10, 33, 2);
-  tft.setTextColor(COLOR_MUTED_GREEN);
-  tft.drawString("Dikelompokkan: Udara & Air", 10, 51, 1);
+    tft.fillRect(0, 0, 480, 30, COLOR_TEXT_WHITE);
+    tft.drawFastHLine(0, 30, 480, COLOR_BORDER_LIGHT);
+    tft.setTextDatum(TL_DATUM); tft.setTextColor(COLOR_TEXT_BLACK);
+    tft.drawString("9:41", 10, 8, 2);
+    tft.fillRoundRect(440, 8, 30, 14, 3, COLOR_ACCENT_GREEN);
+    tft.fillRect(470, 11, 3, 8, COLOR_TEXT_GRAY);
 
-  // Live / No Signal pill
-  uint16_t pillCol = hasLiveData ? COLOR_ACCENT_GREEN : COLOR_TEXT_GRAY;
-  tft.fillRoundRect(388, 33, 82, 22, 11, pillCol);
-  tft.fillCircle(401, 44, 4, COLOR_LIGHT_GREEN);
-  tft.setTextDatum(ML_DATUM); tft.setTextColor(COLOR_TEXT_WHITE);
-  tft.drawString(hasLiveData ? "Live" : "Wait", 409, 44, 1);
+    tft.setTextDatum(TL_DATUM); tft.setTextColor(COLOR_DARK_GREEN);
+    tft.drawString("< Sensor Readings", 10, 33, 2);
+    tft.setTextColor(COLOR_MUTED_GREEN);
+    tft.drawString("Water  -  Air  -  Gas", 10, 51, 1);
 
-  tft.drawFastHLine(0, 62, 480, COLOR_BORDER_LIGHT);
+    uint16_t pillCol = hasLiveData ? COLOR_ACCENT_GREEN : COLOR_TEXT_GRAY;
+    tft.fillRoundRect(388, 33, 82, 22, 11, pillCol);
+    tft.fillCircle(401, 44, 4, COLOR_LIGHT_GREEN);
+    tft.setTextDatum(ML_DATUM); tft.setTextColor(COLOR_TEXT_WHITE);
+    tft.drawString(hasLiveData ? "Live" : "Wait", 409, 44, 1);
+    tft.setTextDatum(TL_DATUM);
 
-  // Sensor Udara header
-  tft.fillCircle(14, 71, 5, COLOR_ACCENT_GREEN);
-  tft.setTextDatum(ML_DATUM); tft.setTextColor(COLOR_DARK_GREEN);
-  tft.drawString("Sensor Udara", 24, 71, 2);
-  tft.setTextDatum(MR_DATUM); tft.setTextColor(COLOR_ACCENT_GREEN);
-  tft.drawString("6 sensor", 474, 71, 1);
+    drawSectionHead(69,  "Water Quality", "5 sensors", TILE_WATER_FG, TILE_WATER_FG);
+    drawSectionHead(159, "Air & Climate", "3 sensors", TILE_AIR_FG,   COLOR_ACCENT_GREEN);
+    drawSectionHead(211, "Gas Sensors",   "5 sensors", TILE_GAS_FG,   TILE_GAS_FG);
+    tft.fillRoundRect(210, 300, 60, 5, 2, COLOR_PILL);
 
-  // Format nilai sensor (char array)
-  char v1[12], v2[12], v3[12], v4[12], v5[12], v6[12];
-  fmtVal(v1, liveData.o2,       1);
-  fmtVal(v2, liveData.pm25,     0);
-  fmtVal(v3, liveData.pm10,     0);
-  fmtVal(v4, liveData.hcho,     3);
-  fmtVal(v5, liveData.voc,      0);
-  fmtVal(v6, liveData.humidity, 1);
+    for (int i = 0; i < 13; i++) {
+      uint16_t fg = (i <= 4) ? TILE_WATER_FG : (i <= 7) ? TILE_AIR_FG : TILE_GAS_FG;
+      tileCardStatic(HOME_TX[i], HOME_TY[i], HOME_TW, HOME_TH, nn[i], fg);
+      prevVal[i][0] = '\0'; prevBadge[i][0] = '\0';   // paksa isi angka+badge di bawah
+    }
+  }
 
-  // Baris 1 Udara (y=80)
-  drawCultureCard(  8, 80, 149, 62, "O2",      v1, "%",      badgeO2(liveData.o2),   0, false);
-  drawCultureCard(165, 80, 149, 62, "PM2.5",   v2, "ug/m3",  badgePM25(liveData.pm25),0, false);
-  drawCultureCard(322, 80, 149, 62, "PM10",    v3, "ug/m3",  badgePM10(liveData.pm10),0, false);
-
-  // Baris 2 Udara (y=146)
-  drawCultureCard(  8,146, 149, 62, "HCHO",    v4, "ppm",    badgeHCHO(liveData.hcho),3, false);
-  drawCultureCard(165,146, 149, 62, "VOC",     v5, "ppb",    badgeVOC(liveData.voc),  3, false);
-  drawCultureCard(322,146, 149, 62, "Humidity",v6, "%",      badgeHum(liveData.humidity),1, false);
-
-  // Sensor Air header
-  tft.fillCircle(14, 220, 5, 0x3C1E);
-  tft.setTextDatum(ML_DATUM); tft.setTextColor(COLOR_DARK_GREEN);
-  tft.drawString("Sensor Air", 24, 220, 2);
-  tft.setTextDatum(MR_DATUM); tft.setTextColor(0x3C1E);
-  tft.drawString("3 sensor", 474, 220, 1);
-
-  char w1[12], w2[12], w3[12];
-  fmtVal(w1, liveData.doValue,   1);
-  fmtVal(w2, liveData.suhuAir,   1);
-  fmtVal(w3, liveData.turbidity, 1);
-
-  // Baris Air (y=230)
-  drawCultureCard(  8,230, 149, 70, "DO",       w1,"mg/L",   badgeDO(liveData.doValue),  1, true);
-  drawCultureCard(165,230, 149, 70, "Suhu Air", w2,"Celsius", badgeTemp(liveData.suhuAir),2, true);
-  drawCultureCard(322,230, 149, 70, "Turbidity",w3,"NTU",     badgeTurb(liveData.turbidity),1, true);
-
-  tft.fillRoundRect(210, 309, 60, 5, 2, COLOR_PILL);
+  // DINAMIS: angka & badge -> update HANYA kalau berubah (kartu TIDAK digambar ulang)
+  for (int i = 0; i < 13; i++) {
+    uint16_t bg = (i <= 4) ? TILE_WATER_BG : (i <= 7) ? TILE_AIR_BG : TILE_GAS_BG;
+    uint16_t fg = (i <= 4) ? TILE_WATER_FG : (i <= 7) ? TILE_AIR_FG : TILE_GAS_FG;
+    char vs[14]; fmtVal(vs, vv[i], dd[i]);
+    if (strcmp(vs, prevVal[i]) != 0) {
+      tileValue(HOME_TX[i], HOME_TY[i], HOME_TW, vs, uu[i]);
+      strncpy(prevVal[i], vs, 13); prevVal[i][13] = '\0';
+    }
+    if (strcmp(bb[i], prevBadge[i]) != 0) {
+      tileBadge(HOME_TX[i], HOME_TY[i], HOME_TW, bb[i], bg, fg);
+      strncpy(prevBadge[i], bb[i], 13); prevBadge[i][13] = '\0';
+    }
+  }
   screenDrawn = true;
 }
 
@@ -767,7 +937,7 @@ void drawWifiStatusCard() {
 
   if (ws == WL_CONNECTED) {
     dotCol = COLOR_ACCENT_GREEN;
-    line1  = "alcura (Terhubung)";
+    line1  = "Alcura (Terhubung)";
     snprintf(ipLine, sizeof(ipLine), "IP: %s", WiFi.localIP().toString().c_str());
     line2  = ipLine;
   } else if (!wifiState) {
@@ -776,8 +946,8 @@ void drawWifiStatusCard() {
     line2  = "Aktifkan WiFi terlebih dahulu";
   } else {
     dotCol = 0xFD20;   // orange = sedang mencoba
-    line1  = "Menghubungkan ke alcura...";
-    line2  = "SSID: alcura | PW: 234alcura156";
+    line1  = "Menghubungkan ke Alcura...";
+    line2  = "SSID: Alcura | PW: 234alcura156";
   }
 
   tft.fillCircle(40, 219, 7, dotCol);
@@ -801,8 +971,11 @@ void showSettings() {
     if (touchY >= 92 && touchY < 178) {
       wifiState = !wifiState;
       if (wifiState) {
-        WiFi.begin("alcura", "234alcura156");
+        WiFi.begin(WIFI_SSID, WIFI_PASS);   // konek hotspot "Alcura" (semua board se-channel)
+        WiFi.setSleep(false);               // jaga ESP-NOW tetap responsif (tanpa modem-sleep)
       } else {
+        // Catatan: matikan WiFi = ALCURA lepas dari hotspot -> data sensor & kontrol
+        // bisa terganggu (semua board sinkron lewat hotspot). Biasakan WiFi tetap ON.
         WiFi.disconnect();
       }
       drawWifiCard();
@@ -916,7 +1089,7 @@ void drawBrightnessCard() {
   tft.fillRoundRect(10, 90, 460, 90, 14, COLOR_ACCENT_GREEN);
   drawBulbIcon(40, 108, COLOR_TEXT_WHITE);
   tft.setTextDatum(ML_DATUM); tft.setTextColor(COLOR_TEXT_WHITE);
-  tft.drawString("Kecerahan", 58, 108, 4);
+  tft.drawString("Brightness", 58, 108, 4);
   char val[8]; sprintf(val, "%d%%", lightBrightness);
   tft.setTextDatum(MR_DATUM); tft.drawString(val, 462, 108, 4);
 
@@ -940,7 +1113,10 @@ void drawLampCard(int idx) {
   tft.fillCircle(icx, icy, 16, on ? COLOR_DARK_GREEN : 0xC618);
   drawBulbIcon(icx, icy, on ? COLOR_TEXT_WHITE : COLOR_TEXT_GRAY);
 
-  char name[10]; sprintf(name, "Lampu %d", idx + 1);
+  // Nama cocok fixture asli di board kontrol: lampu 0=Ring, 1..4=Strip 1..4.
+  // (English — untuk lomba di Jepang.) Tiap kartu = on/off sendiri.
+  static const char* lampLabels[5] = { "Ring Light", "Strip 1", "Strip 2", "Strip 3", "Strip 4" };
+  const char* name = lampLabels[idx];
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(on ? COLOR_TEXT_WHITE : COLOR_DARK_GREEN);
   tft.drawString(name, gx + 43, gy + 16, 2);
@@ -1012,12 +1188,12 @@ void showLight() {
   tft.setTextDatum(TL_DATUM); tft.setTextColor(COLOR_DARK_GREEN);
   tft.drawString("< Light", 15, 40, 4);
   tft.setTextColor(COLOR_MUTED_GREEN);
-  tft.drawString("Kontrol lampu", 36, 68, 2);
+  tft.drawString("Light control", 36, 68, 2);
 
   drawBrightnessCard();
 
   tft.setTextDatum(TL_DATUM); tft.setTextColor(COLOR_TEXT_GRAY);
-  tft.drawString("Lampu", 15, 183, 2);
+  tft.drawString("Lights", 15, 183, 2);
 
   for (int i = 0; i < 5; i++) drawLampCard(i);
 
@@ -1276,12 +1452,14 @@ void showChartDetail() {
     char cmd = Serial.read();
     if (cmd == 'B' || cmd == 'b') { currentState = HOME; delay(200); return; }
   }
-  if (screenDrawn) return;
-  drawChartDetail(chartSensor);
+  bool fullDraw = !screenDrawn;
+  if (!fullDraw && !chartNeedsUpdate) return;   // tidak ada yg perlu digambar
+  chartNeedsUpdate = false;
+  drawChartDetail(chartSensor, fullDraw);
   screenDrawn = true;
 }
 
-void drawChartDetail(int s) {
+void drawChartDetail(int s, bool fullDraw) {
   // Metadata per sensor (title, subtitle, unit, yMin, yMax, yLabels, iconType, isWater, isDegree)
   const char *title, *subtitle, *unit;
   const char* yLabels[5];
@@ -1293,51 +1471,71 @@ void drawChartDetail(int s) {
   float curVal = 0;
 
   switch (s) {
-    case 1:
-      title="DO Monitor"; subtitle="Oksigen Terlarut"; unit="mg/L";
-      yMin=9; yMax=13; iconType=1; isWater=true;
-      yLabels[0]="9.0"; yLabels[1]="10.0"; yLabels[2]="11.0"; yLabels[3]="12.0"; yLabels[4]="13.0";
-      curVal=liveData.doValue; trendUp=true; break;
-    case 2:
-      title="Suhu Air Monitor"; subtitle="Temperatur Air"; unit="C";
-      yMin=24; yMax=32; iconType=2; isWater=true; isDegree=true;
-      yLabels[0]="24"; yLabels[1]="26"; yLabels[2]="28"; yLabels[3]="30"; yLabels[4]="32";
-      curVal=liveData.suhuAir; trendUp=false; break;
-    case 3:
-      title="Turbidity Monitor"; subtitle="Kekeruhan Air"; unit="NTU";
-      yMin=2; yMax=6; iconType=7; isWater=true;
-      yLabels[0]="2.0"; yLabels[1]="3.0"; yLabels[2]="4.0"; yLabels[3]="5.0"; yLabels[4]="6.0";
-      curVal=liveData.turbidity; trendUp=false; break;
-    case 5:
-      title="PM2.5 Monitor"; subtitle="Partikulat Halus"; unit="ug/m3";
-      yMin=0; yMax=40; iconType=0;
-      yLabels[0]="0"; yLabels[1]="10"; yLabels[2]="20"; yLabels[3]="30"; yLabels[4]="40";
-      curVal=liveData.pm25; trendUp=false; break;
-    case 6:
-      title="PM10 Monitor"; subtitle="Partikulat Kasar"; unit="ug/m3";
-      yMin=0; yMax=100; iconType=5;
-      yLabels[0]="0"; yLabels[1]="25"; yLabels[2]="50"; yLabels[3]="75"; yLabels[4]="100";
-      curVal=liveData.pm10; trendUp=true; break;
-    case 7:
-      title="HCHO Monitor"; subtitle="Formaldehida"; unit="ppm";
-      yMin=0.01f; yMax=0.09f; iconType=3;
-      yLabels[0]="0.01"; yLabels[1]="0.03"; yLabels[2]="0.05"; yLabels[3]="0.07"; yLabels[4]="0.09";
-      curVal=liveData.hcho; trendUp=false; break;
-    case 8:
-      title="VOC Monitor"; subtitle="Senyawa Organik"; unit="ppb";
-      yMin=0; yMax=300; iconType=6;
-      yLabels[0]="0"; yLabels[1]="75"; yLabels[2]="150"; yLabels[3]="225"; yLabels[4]="300";
-      curVal=liveData.voc; trendUp=true; break;
-    case 9:
-      title="Humidity Monitor"; subtitle="Kelembapan Udara"; unit="%";
-      yMin=30; yMax=80; iconType=1;
-      yLabels[0]="30"; yLabels[1]="42"; yLabels[2]="55"; yLabels[3]="67"; yLabels[4]="80";
-      curVal=liveData.humidity; trendUp=true; break;
-    default: // 4 = O2
-      title="O2 Monitor"; subtitle="Oksigen"; unit="%";
-      yMin=18; yMax=22; iconType=4;
-      yLabels[0]="18.0"; yLabels[1]="19.0"; yLabels[2]="20.0"; yLabels[3]="21.0"; yLabels[4]="22.0";
-      curVal=liveData.o2; trendUp=true; break;
+    case 1: // pH
+      title="pH Level"; subtitle="Water Acidity"; unit="pH";
+      yMin=0; yMax=14; iconType=3; isWater=true;
+      yLabels[0]="0"; yLabels[1]="3.5"; yLabels[2]="7.0"; yLabels[3]="10.5"; yLabels[4]="14";
+      curVal=liveData.waterPH; break;
+    case 2: // TDS
+      title="TDS"; subtitle="Dissolved Solids"; unit="ppm";
+      yMin=0; yMax=1000; iconType=1; isWater=true;
+      yLabels[0]="0"; yLabels[1]="250"; yLabels[2]="500"; yLabels[3]="750"; yLabels[4]="1000";
+      curVal=liveData.tds; break;
+    case 3: // Water Temp
+      title="Water Temp"; subtitle="Water Temperature"; unit="C";
+      yMin=20; yMax=35; iconType=2; isWater=true; isDegree=true;
+      yLabels[0]="20"; yLabels[1]="24"; yLabels[2]="28"; yLabels[3]="31"; yLabels[4]="35";
+      curVal=liveData.waterTemp; break;
+    case 4: // Water Level
+      title="Water Level"; subtitle="Tank Distance"; unit="cm";
+      yMin=0; yMax=30; iconType=1; isWater=true;
+      yLabels[0]="0"; yLabels[1]="8"; yLabels[2]="15"; yLabels[3]="23"; yLabels[4]="30";
+      curVal=liveData.waterLevel; break;
+    case 5: // Turbidity
+      title="Turbidity"; subtitle="Water Clarity"; unit="NTU";
+      yMin=0; yMax=50; iconType=3; isWater=true;
+      yLabels[0]="0"; yLabels[1]="12"; yLabels[2]="25"; yLabels[3]="37"; yLabels[4]="50";
+      curVal=liveData.turbidity; break;
+    case 6: // UV Index
+      title="UV Index"; subtitle="UV Radiation"; unit="idx";
+      yMin=0; yMax=12; iconType=0;
+      yLabels[0]="0"; yLabels[1]="3"; yLabels[2]="6"; yLabels[3]="9"; yLabels[4]="12";
+      curVal=liveData.uvIndex; break;
+    case 7: // Air Temp
+      title="Air Temp"; subtitle="Ambient Temperature"; unit="C";
+      yMin=20; yMax=40; iconType=2; isDegree=true;
+      yLabels[0]="20"; yLabels[1]="25"; yLabels[2]="30"; yLabels[3]="35"; yLabels[4]="40";
+      curVal=liveData.airTemp; break;
+    case 8: // Humidity
+      title="Humidity"; subtitle="Air Humidity"; unit="%";
+      yMin=30; yMax=90; iconType=1;
+      yLabels[0]="30"; yLabels[1]="45"; yLabels[2]="60"; yLabels[3]="75"; yLabels[4]="90";
+      curVal=liveData.humidity; break;
+    case 9: // H2
+      title="H2"; subtitle="Hydrogen Gas"; unit="ppm";
+      yMin=0; yMax=1000; iconType=0;
+      yLabels[0]="0"; yLabels[1]="250"; yLabels[2]="500"; yLabels[3]="750"; yLabels[4]="1000";
+      curVal=liveData.gasH2; break;
+    case 10: // CH4
+      title="CH4"; subtitle="Methane Gas"; unit="ppm";
+      yMin=0; yMax=1000; iconType=0;
+      yLabels[0]="0"; yLabels[1]="250"; yLabels[2]="500"; yLabels[3]="750"; yLabels[4]="1000";
+      curVal=liveData.gasCH4; break;
+    case 11: // CO
+      title="CO"; subtitle="Carbon Monoxide"; unit="ppm";
+      yMin=0; yMax=4095; iconType=0;
+      yLabels[0]="0"; yLabels[1]="1024"; yLabels[2]="2048"; yLabels[3]="3072"; yLabels[4]="4095";
+      curVal=liveData.gasCO; break;
+    case 12: // CO2
+      title="CO2"; subtitle="Carbon Dioxide"; unit="ppm";
+      yMin=0; yMax=1000; iconType=0;
+      yLabels[0]="0"; yLabels[1]="250"; yLabels[2]="500"; yLabels[3]="750"; yLabels[4]="1000";
+      curVal=liveData.gasCO2; break;
+    default: // 13 = O2
+      title="O2"; subtitle="Oxygen Gas"; unit="ppm";
+      yMin=0; yMax=1000; iconType=0;
+      yLabels[0]="0"; yLabels[1]="250"; yLabels[2]="500"; yLabels[3]="750"; yLabels[4]="1000";
+      curVal=liveData.gasO2; break;
   }
 
   // Hitung min/avg/max dari ring buffer
@@ -1349,11 +1547,16 @@ void drawChartDetail(int s) {
   }
   trendUp = (chartBuf[s][CHART_POINTS-1] >= chartBuf[s][0]);
 
+  // Desimal per sensor: pH=2; TDS/Humidity/gas=0; lainnya=1
+  uint8_t dec = 1;
+  if (s == 1) dec = 2;
+  else if (s == 2 || s == 8 || s >= 9) dec = 0;
+
   char statMin[12], statAvg[12], statMax[12], bigValue[12];
-  dtostrf(bMin, -1, (s==7)?3:1, statMin);
-  dtostrf(bSum / CHART_POINTS, -1, (s==7)?3:1, statAvg);
-  dtostrf(bMax, -1, (s==7)?3:1, statMax);
-  dtostrf(curVal, -1, (s==7)?3:(isDegree?1:1), bigValue);
+  dtostrf(bMin, -1, dec, statMin);
+  dtostrf(bSum / CHART_POINTS, -1, dec, statAvg);
+  dtostrf(bMax, -1, dec, statMax);
+  dtostrf(curVal, -1, dec, bigValue);
 
   // Trend string: diff antara titik terakhir dan pertama
   char trendStr[10];
@@ -1372,46 +1575,87 @@ void drawChartDetail(int s) {
   uint16_t thFill    = isWater ? COLOR_CHART_FILL_BLUE   : COLOR_CHART_FILL;
   uint16_t thLight   = isWater ? COLOR_LIGHT_BLUE        : COLOR_LIGHT_GREEN;
 
-  // ===== PANEL KIRI =====
-  tft.fillRect(0, 0, 184, 320, thAccent);
+  // Geometri plot & posisi X (statis, tak bergantung data)
+  const int pL = 232, pR = 462, pT = 56, pB = 222;
+  int xp[CHART_POINTS], yp[CHART_POINTS];
+  for (int i = 0; i < CHART_POINTS; i++) xp[i] = pL + (pR - pL) * i / (CHART_POINTS - 1);
+  int sy = 260, sh = 54, sx[3] = {190, 287, 384};
 
-  // Tombol kembali
-  tft.drawLine(20,19,12,26,0xFFFF); tft.drawLine(12,26,20,33,0xFFFF);
-  tft.drawLine(21,19,13,26,0xFFFF); tft.drawLine(13,26,21,33,0xFFFF);
-  tft.setTextDatum(ML_DATUM); tft.setTextColor(0xFFFF);
-  tft.drawString("Kembali", 30, 26, 2);
+  // ============ BAGIAN STATIS (digambar SEKALI saat masuk halaman) ============
+  if (fullDraw) {
+    // ----- PANEL KIRI -----
+    tft.fillRect(0, 0, 184, 320, thAccent);
+    tft.drawLine(20,19,12,26,0xFFFF); tft.drawLine(12,26,20,33,0xFFFF);
+    tft.drawLine(21,19,13,26,0xFFFF); tft.drawLine(13,26,21,33,0xFFFF);
+    tft.setTextDatum(ML_DATUM); tft.setTextColor(0xFFFF);
+    tft.drawString("Kembali", 30, 26, 2);
 
-  // Icon
-  tft.fillCircle(92, 92, 32, COLOR_ICON_CIRCLE);
-  drawBigSensorIcon(92, 92, iconType, thAccent);
+    tft.fillCircle(92, 92, 32, COLOR_ICON_CIRCLE);
+    drawBigSensorIcon(92, 92, iconType, thAccent);
 
-  // Judul & nilai
+    tft.setTextDatum(MC_DATUM); tft.setTextColor(0xFFFF);
+    tft.drawString(title, 92, 144, 4);
+    tft.setTextColor(thMutedLt);
+    tft.drawString(subtitle, 92, 168, 2);
+
+    tft.setTextColor(thMutedLt);
+    if (isDegree) {
+      tft.setTextDatum(ML_DATUM);
+      tft.drawCircle(80, 230, 3, thMutedLt);
+      tft.drawString("C", 87, 232, 2);
+    } else {
+      tft.setTextDatum(MC_DATUM);
+      tft.drawString(unit, 92, 232, 2);
+    }
+
+    tft.fillCircle(40, 296, 4, thMutedLt);
+    tft.setTextDatum(ML_DATUM); tft.setTextColor(0xFFFF);
+    tft.drawString(hasLiveData ? "Real-time" : "Demo data", 52, 296, 2);
+
+    // ----- PANEL KANAN (kerangka) -----
+    tft.fillRect(184, 0, 296, 320, thBgRight);
+    drawRoundedCard(190, 8, 284, 248, 14, 0xFFFF);
+    tft.setTextDatum(TL_DATUM); tft.setTextColor(thDark);
+    tft.drawString("Tren 12 Titik Terakhir", 202, 18, 2);
+    tft.setTextDatum(TR_DATUM); tft.setTextColor(thMuted);
+    tft.drawString("~12 detik", 462, 18, 2);
+    tft.drawFastHLine(202, 40, 260, COLOR_BORDER_LIGHT);
+
+    // Label Y (di luar area plot -> statis)
+    for (int i = 0; i < 5; i++) {
+      int gy = pB - (pB - pT) * i / 4;
+      tft.setTextDatum(MR_DATUM); tft.setTextColor(thMuted);
+      tft.drawString(yLabels[i], pL - 6, gy, 1);
+    }
+    // Label X (statis)
+    const char* xl[4] = {"T-11", "T-7", "T-4", "T-0"};
+    int xi[4] = {0, 4, 8, 11};
+    tft.setTextDatum(TC_DATUM); tft.setTextColor(thMuted);
+    for (int k = 0; k < 4; k++) tft.drawString(xl[k], xp[xi[k]], pB + 8, 1);
+
+    // Kartu statistik (kerangka + label, nilainya dinamis di bawah)
+    const char* slab[3] = {"Min", "Avg", "Max"};
+    for (int k = 0; k < 3; k++) {
+      drawRoundedCard(sx[k], sy, 90, sh, 10, thLight);
+      tft.setTextDatum(TC_DATUM); tft.setTextColor(thMuted);
+      tft.drawString(slab[k], sx[k] + 45, sy + 8, 2);
+    }
+  }
+
+  // ============ BAGIAN DINAMIS (update tiap data, area kecil saja) ============
+  // --- Nilai besar (panel kiri): hapus area lalu tulis ulang ---
+  tft.fillRect(10, 184, 164, 42, thAccent);
   tft.setTextDatum(MC_DATUM); tft.setTextColor(0xFFFF);
-  tft.drawString(title, 92, 144, 4);
-  tft.setTextColor(thMutedLt);
-  tft.drawString(subtitle, 92, 168, 2);
-  tft.setTextColor(0xFFFF);
   tft.drawString(bigValue, 92, 204, 6);
-
   if (isDegree) {
     int w = tft.textWidth(bigValue, 6);
     tft.drawCircle(92 + w/2 + 9, 190, 5, 0xFFFF);
     tft.drawCircle(92 + w/2 + 9, 190, 4, 0xFFFF);
   }
 
-  // Unit
-  tft.setTextColor(thMutedLt);
-  if (isDegree) {
-    tft.setTextDatum(ML_DATUM);
-    tft.drawCircle(80, 230, 3, thMutedLt);
-    tft.drawString("C", 87, 232, 2);
-  } else {
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(unit, 92, 232, 2);
-  }
-
-  // Pill tren
+  // --- Pill tren: hapus area lalu tulis ulang ---
   int pw = 88, ph = 24, px = 92 - pw/2, py = 252;
+  tft.fillRect(px, py, pw, ph, thAccent);
   tft.fillRoundRect(px, py, pw, ph, ph/2, thLight);
   int tx2 = px + 22, ty2 = py + ph/2;
   if (trendUp) tft.fillTriangle(tx2, ty2-5, tx2-5, ty2+4, tx2+5, ty2+4, thAccent);
@@ -1419,42 +1663,17 @@ void drawChartDetail(int s) {
   tft.setTextDatum(ML_DATUM); tft.setTextColor(thAccent);
   tft.drawString(trendStr, tx2 + 12, ty2, 2);
 
-  // Real-time dot
-  tft.fillCircle(40, 296, 4, thMutedLt);
-  tft.setTextDatum(ML_DATUM); tft.setTextColor(0xFFFF);
-  tft.drawString(hasLiveData ? "Real-time" : "Demo data", 52, 296, 2);
-
-  // ===== PANEL KANAN =====
-  tft.fillRect(184, 0, 296, 320, thBgRight);
-  drawRoundedCard(190, 8, 284, 248, 14, 0xFFFF);
-
-  tft.setTextDatum(TL_DATUM); tft.setTextColor(thDark);
-  tft.drawString("Tren 12 Titik Terakhir", 202, 18, 2);
-  tft.setTextDatum(TR_DATUM); tft.setTextColor(thMuted);
-  tft.drawString("~12 detik", 462, 18, 2);
-  tft.drawFastHLine(202, 40, 260, COLOR_BORDER_LIGHT);
-
-  // Area plot
-  int pL = 232, pR = 462, pT = 56, pB = 222;
-
-  // Gridline + label Y
+  // --- Plot: hapus interior, gambar grid + area + garis + titik ---
+  tft.fillRect(pL, pT, pR - pL, pB - pT + 1, 0xFFFF);   // bersihkan HANYA area plot
   for (int i = 0; i < 5; i++) {
     int gy = pB - (pB - pT) * i / 4;
     for (int gx = pL; gx < pR; gx += 8) tft.drawFastHLine(gx, gy, 4, COLOR_BORDER_LIGHT);
-    tft.setTextDatum(MR_DATUM); tft.setTextColor(thMuted);
-    tft.drawString(yLabels[i], pL - 6, gy, 1);
   }
-
-  // Konversi data ke pixel
-  int xp[CHART_POINTS], yp[CHART_POINTS];
   float rng = yMax - yMin;
   for (int i = 0; i < CHART_POINTS; i++) {
-    xp[i] = pL + (pR - pL) * i / (CHART_POINTS - 1);
     float t = (rng > 0) ? constrain((chartBuf[s][i] - yMin) / rng, 0.0f, 1.0f) : 0.5f;
     yp[i] = pB - (int)(t * (pB - pT));
   }
-
-  // Area fill
   for (int i = 0; i < CHART_POINTS - 1; i++) {
     int x0 = xp[i], x1 = xp[i + 1];
     for (int x = x0; x <= x1; x++) {
@@ -1463,15 +1682,11 @@ void drawChartDetail(int s) {
       if (y < pB) tft.drawFastVLine(x, y, pB - y, thFill);
     }
   }
-
-  // Garis kurva (3px)
   for (int i = 0; i < CHART_POINTS - 1; i++) {
     tft.drawLine(xp[i], yp[i],     xp[i+1], yp[i+1],     thLine);
     tft.drawLine(xp[i], yp[i] - 1, xp[i+1], yp[i+1] - 1, thLine);
     tft.drawLine(xp[i], yp[i] + 1, xp[i+1], yp[i+1] + 1, thLine);
   }
-
-  // Marker titik (titik terakhir lebih besar)
   for (int i = 0; i < CHART_POINTS; i++) {
     if (i == CHART_POINTS - 1) {
       tft.fillCircle(xp[i], yp[i], 7, thLight);
@@ -1482,22 +1697,11 @@ void drawChartDetail(int s) {
     }
   }
 
-  // Label X
-  const char* xl[4] = {"T-11", "T-7", "T-4", "T-0"};
-  int xi[4] = {0, 4, 8, 11};
-  tft.setTextDatum(TC_DATUM); tft.setTextColor(thMuted);
-  for (int k = 0; k < 4; k++) tft.drawString(xl[k], xp[xi[k]], pB + 8, 1);
-
-  // ===== Kartu statistik =====
-  int sy = 260, sh = 54;
-  const char* slab[3] = {"Min", "Avg", "Max"};
+  // --- Nilai statistik (Min/Avg/Max): hapus area nilai lalu tulis ulang ---
   const char* sval[3] = {statMin, statAvg, statMax};
-  int sx[3] = {190, 287, 384};
   for (int k = 0; k < 3; k++) {
-    drawRoundedCard(sx[k], sy, 90, sh, 10, thLight);
-    tft.setTextDatum(TC_DATUM); tft.setTextColor(thMuted);
-    tft.drawString(slab[k], sx[k] + 45, sy + 8, 2);
-    tft.setTextColor(thDark);
+    tft.fillRect(sx[k] + 6, sy + 22, 78, 28, thLight);
+    tft.setTextDatum(TC_DATUM); tft.setTextColor(thDark);
     tft.drawString(sval[k], sx[k] + 45, sy + 26, 4);
   }
 }
