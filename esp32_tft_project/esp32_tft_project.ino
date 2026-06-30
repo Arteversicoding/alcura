@@ -37,20 +37,28 @@ const char* FB_CTRL_PATH = "/control.json";
 TFT_eSPI tft = TFT_eSPI();
 
 // ===== STRUCT ESP-NOW (identik byte-for-byte dengan board sensor) =====
-// 13 nilai sensor = 13 kartu/grafik. Urutan field JANGAN diubah.
+// 13 sensor nyata semua. Urutan field JANGAN diubah tanpa update board sensor.
 struct __attribute__((packed)) SensorData {
   uint8_t msgType;
   // Water Quality (chart 1-5, tema biru)
   float waterPH, tds, waterTemp, waterLevel, turbidity;
   // Air & Climate (chart 6-8, tema hijau)
   float uvIndex, airTemp, humidity;
-  // Gas (chart 9-13, tema amber)
-  float gasH2, gasCH4, gasCO, gasCO2, gasO2;
+  // Gas Sensors (chart 9-13, tema amber — semua dari sensor nyata)
+  float gasH2;    // ppm H2  — MP-02    (chart 9)
+  float gasCH4;   // ppm CH4 — MQ-135   (chart 10)
+  float gasCO;    // raw ADC — FF sensor (chart 11)
+  float gasCO2;   // ppm CO2 — ENS160   (chart 12)
+  float gasO2;    // % O2   — MP-02     (chart 13)
+  // Kualitas Udara — Gravity SEN0460 (chart 14-16)
+  float pm25;    // µg/m³ Fine Dust        (chart 14)
+  float pm10;    // µg/m³ Coarse Dust      (chart 15)
+  float pm1_0;   // µg/m³ Ultra Fine Dust  (chart 16)
 };
 
 struct __attribute__((packed)) ControlData {
   uint8_t msgType;
-  bool    lampState[5];
+  bool    lampState[4];
   uint8_t brightness;
   bool    fanState[2];
   bool    pumpState[2];   // 2 pompa udara (board relay)
@@ -58,23 +66,26 @@ struct __attribute__((packed)) ControlData {
 
 // ===== Live sensor data ===== (default wajar sebelum paket pertama tiba)
 SensorData liveData = {0,
-  7.2f, 250.0f, 27.0f, 12.0f, 3.0f,   // water: pH, TDS, waterTemp, level, turbidity
-  2.0f, 28.0f, 52.0f,                 // air: uvIndex, airTemp, humidity
-  400.0f, 450.0f, 350.0f, 600.0f, 800.0f}; // gas: H2, CH4, CO, CO2, O2
+  7.2f, 250.0f, 27.0f, 12.0f, 3.0f,              // water
+  2.0f, 28.0f, 52.0f,                             // air
+  300.0f, 500.0f, 350.0f, 600.0f, 20.9f,         // gas: H2, CH4, CO, CO2(ENS), O2
+  8.0f, 15.0f, 5.0f};                             // Fine Dust, Coarse Dust, Ultra Fine Dust
 SensorData pendingData;
 volatile bool dataFresh    = false;
 bool          hasLiveData  = false; // true setelah paket ESP-NOW pertama
 
 // ===== Chart ring buffer — 12 titik per sensor (index 1–13) =====
 #define CHART_POINTS 12
-#define CHART_COUNT  13
+#define CHART_COUNT  16
 float chartBuf[CHART_COUNT + 1][CHART_POINTS];
 
 // Default chart init (urut index 1..13 sesuai chartSensor)
 void initChartBufs() {
   float def[CHART_COUNT + 1] = {0,
-    7.2f, 250.0f, 27.0f, 12.0f, 3.0f, 2.0f, 28.0f, 52.0f,
-    400.0f, 450.0f, 350.0f, 600.0f, 800.0f};
+    7.2f, 250.0f, 27.0f, 12.0f, 3.0f,          // water
+    2.0f, 28.0f, 52.0f,                          // air
+    300.0f, 500.0f, 350.0f, 600.0f, 20.9f,      // gas: H2, CH4, CO, CO2(ENS), O2
+    8.0f, 15.0f, 5.0f};                          // Fine Dust(14), Coarse Dust(15), Ultra Fine(16)
   for (int s = 1; s <= CHART_COUNT; s++)
     for (int i = 0; i < CHART_POINTS; i++) chartBuf[s][i] = def[s];
 }
@@ -113,8 +124,8 @@ bool          homeNeedsValueUpdate = false;
 bool          chartNeedsUpdate = false;
 
 // ===== Light page state =====
-bool lampState[5]    = {true, true, false, true, false};
-int  lightBrightness = 72;
+bool lampState[4]    = {false, false, false, false};
+int  lightBrightness = 100;
 
 // ===== Fan page state =====
 bool fanState[2] = {true, false};
@@ -131,8 +142,12 @@ bool wifiState = true;
 uint8_t broadcastMAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 bool espReady = false;
 
+// ===== Web command polling =====
+unsigned long lastWebPoll   = 0;
+
 void sendControl();
 void sendControlEspNow();
+void pollControlFirebase();
 
 // Forward declaration (parameter function-pointer -> bantu auto-prototype Arduino)
 void drawMenuGridCard(int x, int y, int w, int h,
@@ -200,7 +215,7 @@ void sendControlEspNow() {
   if (!espReady) return;
   ControlData ctrl;
   ctrl.msgType = 1;
-  for (int i = 0; i < 5; i++) ctrl.lampState[i] = lampState[i];
+  for (int i = 0; i < 4; i++) ctrl.lampState[i] = lampState[i];
   ctrl.brightness = (uint8_t)lightBrightness;
   ctrl.fanState[0] = fanState[0];
   ctrl.fanState[1] = fanState[1];
@@ -227,13 +242,13 @@ void pushControlFirebase() {
   char body[400];
   snprintf(body, sizeof(body),
     "{"
-    "\"lamp\":{\"l1\":%s,\"l2\":%s,\"l3\":%s,\"l4\":%s,\"l5\":%s,\"brightness\":%d},"
+    "\"lamp\":{\"l1\":%s,\"l2\":%s,\"l3\":%s,\"l4\":%s,\"brightness\":%d},"
     "\"fan\":{\"fan1\":%s,\"fan2\":%s},"
     "\"pump\":{\"pump1\":%s,\"pump2\":%s},"
     "\"uptime\":%lu"
     "}",
-    lampState[0]?"true":"false", lampState[1]?"true":"false", lampState[2]?"true":"false",
-    lampState[3]?"true":"false", lampState[4]?"true":"false", lightBrightness,
+    lampState[0]?"true":"false", lampState[1]?"true":"false",
+    lampState[2]?"true":"false", lampState[3]?"true":"false", lightBrightness,
     fanState[0]?"true":"false", fanState[1]?"true":"false",
     pumpState[0]?"true":"false", pumpState[1]?"true":"false",
     millis() / 1000UL);
@@ -247,6 +262,73 @@ void pushControlFirebase() {
     fbCtrlCode = https.PUT((uint8_t*)body, strlen(body));
     https.end();
   } else fbCtrlCode = -2;
+}
+
+// ===== WEB COMMAND =====
+// Parse field integer dari flat JSON (misal: "seq":12345).
+static int jsonInt(const String& j, const char* key) {
+  String k = String("\"") + key + "\":";
+  int idx = j.indexOf(k);
+  if (idx < 0) return -32768;
+  return j.substring(idx + k.length()).toInt();
+}
+// Parse field boolean dari flat JSON (misal: "l1":true).
+static bool jsonBool(const String& j, const char* key) {
+  String k = String("\"") + key + "\":";
+  int idx = j.indexOf(k);
+  if (idx < 0) return false;
+  idx += k.length();
+  while (idx < (int)j.length() && j[idx] == ' ') idx++;
+  return j.substring(idx, idx + 4) == "true";
+}
+
+// Baca /control.json dari Firebase. Kalau ada field yang BERBEDA dari state lokal
+// (artinya web app mengubah sesuatu), terapkan ke state lokal lalu kirim ESP-NOW
+// dan redraw layar. Ini membuat web app bisa mengontrol display + relay + LED
+// secara realtime — dua arah: display->Firebase dan Firebase->display+boards.
+void pollControlFirebase() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(5);
+  HTTPClient https;
+  https.setTimeout(5000);
+  String url = String("https://") + FB_HOST + FB_CTRL_PATH;
+  if (!https.begin(client, url)) return;
+  int code = https.GET();
+  String body = (code == 200) ? https.getString() : "";
+  https.end();
+  if (body.length() < 5 || body == "null") return;
+
+  // Parse state dari Firebase (key sama persis dgn yg ditulis pushControlFirebase)
+  bool newLamp[4] = {
+    jsonBool(body, "l1"), jsonBool(body, "l2"),
+    jsonBool(body, "l3"), jsonBool(body, "l4")
+  };
+  int  newBright   = jsonInt(body, "brightness");
+  bool newFan[2]   = { jsonBool(body, "fan1"), jsonBool(body, "fan2") };
+  bool newPump[2]  = { jsonBool(body, "pump1"), jsonBool(body, "pump2") };
+
+  // Cek apakah ada perubahan vs state lokal
+  bool changed = false;
+  for (int i = 0; i < 4; i++) if (newLamp[i] != lampState[i]) { changed = true; break; }
+  if (!changed && newBright >= 0 && newBright <= 100 && newBright != lightBrightness) changed = true;
+  if (!changed && (newFan[0] != fanState[0] || newFan[1] != fanState[1]))  changed = true;
+  if (!changed && (newPump[0] != pumpState[0] || newPump[1] != pumpState[1])) changed = true;
+
+  if (!changed) return;   // Firebase sama dgn lokal, tidak ada yg perlu dilakukan
+
+  // Terapkan perubahan dari Firebase ke state lokal
+  for (int i = 0; i < 4; i++) lampState[i] = newLamp[i];
+  if (newBright >= 0 && newBright <= 100) lightBrightness = newBright;
+  fanState[0]  = newFan[0];  fanState[1]  = newFan[1];
+  pumpState[0] = newPump[0]; pumpState[1] = newPump[1];
+
+  sendControlEspNow();   // langsung kirim ke board kontrol + LED via ESP-NOW
+  screenDrawn = false;   // paksa redraw halaman aktif (display ikut update)
+  Serial.printf("[FB->ESP] lamp:%d%d%d%d bright:%d fan:%d%d pump:%d%d\n",
+    lampState[0], lampState[1], lampState[2], lampState[3],
+    lightBrightness, fanState[0], fanState[1], pumpState[0], pumpState[1]);
 }
 
 // ===== PALET WARNA HIJAU MEWAH =====
@@ -283,14 +365,20 @@ void pushControlFirebase() {
 #define TILE_GAS_FG    0xCC40   // dark amber
 
 // ===== Badge helpers (English) per sensor =====
-const char* badgePH(float v)   { return v < 6.5f ? "Acidic" : v <= 8.5f ? "Optimal" : "Alkaline"; }
-const char* badgeTDS(float v)  { return v < 300 ? "Fresh" : v < 600 ? "Fair" : "High"; }
-const char* badgeTemp(float v) { return (v >= 24 && v <= 30) ? "Normal" : v < 24 ? "Cold" : "Hot"; }
-const char* badgeLevel(float v){ return v < 5 ? "Full" : v < 15 ? "Normal" : "Low"; }
-const char* badgeTurb(float v) { return v <= 5.0f ? "Clear" : v <= 15.0f ? "Cloudy" : "Turbid"; }
-const char* badgeUV(float v)   { return v <= 2 ? "Low" : v <= 5 ? "Moderate" : v <= 7 ? "High" : "Extreme"; }
-const char* badgeHum(float v)  { return (v >= 40 && v <= 60) ? "Ideal" : v < 40 ? "Dry" : "Humid"; }
-const char* badgeGas(float v)  { return v < 1000 ? "Safe" : v < 2500 ? "Warning" : "Hazard"; }
+const char* badgePH(float v)    { return v < 6.5f ? "Acidic"    : v <= 8.5f ? "Optimal"   : "Alkaline"; }
+const char* badgeTDS(float v)   { return v < 300   ? "Fresh"     : v < 600   ? "Fair"       : "High"; }
+const char* badgeTemp(float v)  { return (v>=24&&v<=30) ? "Normal" : v<24    ? "Cold"        : "Hot"; }
+const char* badgeLevel(float v) { return v < 5     ? "Full"      : v < 15    ? "Normal"      : "Low"; }
+const char* badgeTurb(float v)  { return v <= 5.0f ? "Clear"     : v <= 15.0f ? "Cloudy"    : "Turbid"; }
+const char* badgeUV(float v)    { return v <= 2    ? "Low"       : v <= 5    ? "Moderate"    : v <= 7 ? "High" : "Extreme"; }
+const char* badgeHum(float v)   { return (v>=40&&v<=60) ? "Ideal": v < 40   ? "Dry"         : "Humid"; }
+const char* badgeH2(float v)    { return v < 500   ? "Safe"      : v < 1000  ? "Warning"     : "Hazard"; }
+const char* badgeCH4(float v)   { return v < 1000  ? "Safe"      : v < 5000  ? "Warning"     : "Hazard"; }
+const char* badgeCO(float v)    { return v < 1000  ? "Safe"      : v < 2500  ? "Warning"     : "Hazard"; }
+const char* badgeCO2(float v)   { return v < 600   ? "Good"      : v < 1000  ? "Moderate"    : "Poor"; }
+const char* badgeO2(float v)    { return v > 19.5f ? "Normal"    : v > 16.0f ? "Low"         : "Critical"; }
+const char* badgePM25(float v)  { return v < 12.1f ? "Clean" : v < 35.5f ? "Moderate" : v < 55.5f ? "Sensitive" : v < 150.5f ? "Unhealthy" : "Hazardous"; }
+const char* badgePM10(float v)  { return v < 54.0f ? "Clean" : v < 154.0f ? "Moderate" : v < 254.0f ? "Sensitive" : v < 354.0f ? "Unhealthy" : "Hazardous"; }
 
 // Format float ke string
 void fmtVal(char* buf, float v, uint8_t dec) { dtostrf(v, -1, dec, buf); }
@@ -339,6 +427,9 @@ void loop() {
     pushChart(11, liveData.gasCO);
     pushChart(12, liveData.gasCO2);
     pushChart(13, liveData.gasO2);
+    pushChart(14, liveData.pm25);
+    pushChart(15, liveData.pm10);
+    pushChart(16, liveData.pm1_0);
     // Paksa redraw HANYA bagian yang perlu (anti-kedip):
     //  - HOME: paket pertama -> full draw (munculkan "Live"); berikutnya update angka saja.
     //  - CHART_DETAIL: gambar ulang grafik.
@@ -370,9 +461,9 @@ void loop() {
     case PUMP:           showPump();         break;
   }
 
-  // HEARTBEAT ESP-NOW tiap 1 dtk: kirim ulang status kontrol supaya board kontrol
+  // HEARTBEAT ESP-NOW tiap 200ms: kirim ulang status kontrol supaya board kontrol
   // tetap sinkron walau ada paket toggle yang drop (anti "kadang ga on/off").
-  if (millis() - lastCtrlBroadcast >= 1000UL) {
+  if (millis() - lastCtrlBroadcast >= 200UL) {
     lastCtrlBroadcast = millis();
     sendControlEspNow();
   }
@@ -385,6 +476,16 @@ void loop() {
     controlDirty = false;
     lastCtrlPush = millis();
     pushControlFirebase();
+  }
+
+  // Poll /control.json tiap 5 dtk untuk sinkronisasi dua arah dengan web app.
+  // Skip saat user aktif di halaman kontrol atau baru saja mengubah sesuatu
+  // (3 dtk grace period) supaya sentuhan lokal tidak di-overwrite Firebase.
+  bool onCtrlPage  = (currentState == LIGHT || currentState == FAN || currentState == PUMP);
+  bool localRecent = millis() - lastCtrlChange < 3000UL;
+  if (!onCtrlPage && !localRecent && millis() - lastWebPoll >= 5000UL) {
+    lastWebPoll = millis();
+    pollControlFirebase();
   }
 
   delay(50);
@@ -787,13 +888,24 @@ void drawSectionHead(int y, const char* title, const char* count, uint16_t dot, 
 }
 
 // ==================== HOME PAGE (real-time) ====================
-// Layout 3 kolom (x=6/166/326, w=148). chartSensor 1-13.
-// Posisi 13 kotak (urut chartSensor 1..13). Tinggi kotak = 36.
-//  Water row1 y=78 | Water row2 y=116 | Air y=168 | Gas row1 y=220 | Gas row2 y=258
-static const int HOME_TX[13] = {6,166,326, 6,166, 6,166,326, 6,166,326, 6,166};
-static const int HOME_TY[13] = {78,78,78, 116,116, 168,168,168, 220,220,220, 258,258};
-#define HOME_TW 148
-#define HOME_TH 36
+// Layout 3 kolom (x=6/166/326, w=148). chartSensor 1-16. Tile tinggi 28px.
+//  Water row1 y=69 | Water row2 y=99
+//  Air row1 y=134 (UV/AirTemp/Humidity) | Air row2 y=164 (Fine/Coarse/UltraFine Dust)
+//  Gas row1 y=202 | Gas row2 y=232
+static const int HOME_TX[16] = {
+  6,166,326,  6,166,           // Water 1-5
+  6,166,326,                   // Air   6-8
+  6,166,326,  6,166,           // Gas   9-13
+  6, 166, 326                  // Dust  14-16
+};
+static const int HOME_TY[16] = {
+  69,69,69,   99,99,           // Water rows
+  134,134,134,                  // Air row1
+  202,202,202, 232,232,         // Gas rows
+  164, 164, 164                 // Dust row (Air row2)
+};
+#define HOME_TW  148
+#define HOME_TH   28
 
 void showHome() {
   if (tft.getTouch(&touchX, &touchY, 200)) {
@@ -803,11 +915,12 @@ void showHome() {
     if (touchY < 62) { currentState = MENU; screenDrawn = false; delay(200); return; }
 
     int sel = 0;
-    if      (touchY >= 78  && touchY < 114) sel = 1 + col;            // Water row1
-    else if (touchY >= 116 && touchY < 152 && col < 2) sel = 4 + col; // Water row2
-    else if (touchY >= 168 && touchY < 204) sel = 6 + col;            // Air
-    else if (touchY >= 220 && touchY < 256) sel = 9 + col;            // Gas row1
-    else if (touchY >= 258 && touchY < 294 && col < 2) sel = 12 + col;// Gas row2
+    if      (touchY >= 69  && touchY < 99)                sel = 1 + col;   // Water row1
+    else if (touchY >= 99  && touchY < 128 && col < 2)   sel = 4 + col;   // Water row2
+    else if (touchY >= 134 && touchY < 164)               sel = 6 + col;   // Air row1
+    else if (touchY >= 164 && touchY < 196)               sel = 14 + col;  // Air row2 (Dust)
+    else if (touchY >= 202 && touchY < 232)               sel = 9 + col;   // Gas row1
+    else if (touchY >= 232 && touchY < 262 && col < 2)   sel = 12 + col;  // Gas row2
 
     if (sel >= 1 && sel <= CHART_COUNT) {
       chartSensor = sel;
@@ -824,20 +937,29 @@ void showHome() {
   if (!fullDraw && !homeNeedsValueUpdate) return;   // tidak ada yg perlu digambar
   homeNeedsValueUpdate = false;
 
-  // Susun 13 kotak urut chartSensor 1..13
-  float vv[13] = {
+  // Susun 16 kotak urut chartSensor 1..16 (semua data nyata)
+  float vv[16] = {
     liveData.waterPH, liveData.tds, liveData.waterTemp, liveData.waterLevel, liveData.turbidity,
     liveData.uvIndex, liveData.airTemp, liveData.humidity,
-    liveData.gasH2, liveData.gasCH4, liveData.gasCO, liveData.gasCO2, liveData.gasO2 };
-  const uint8_t dd[13] = {2,0,1,1,1, 0,1,0, 0,0,0,0,0};
-  const char* nn[13] = {"pH Level","TDS","Water Temp","Water Level","Turbidity",
-                        "UV Index","Air Temp","Humidity","H2","CH4","CO","CO2","O2"};
-  const char* uu[13] = {"pH","ppm","C","cm","NTU","idx","C","%","ppm","ppm","ppm","ppm","ppm"};
-  const char* bb[13] = {
-    badgePH(vv[0]), badgeTDS(vv[1]), badgeTemp(vv[2]), badgeLevel(vv[3]), badgeTurb(vv[4]),
-    badgeUV(vv[5]), badgeTemp(vv[6]), badgeHum(vv[7]),
-    badgeGas(vv[8]), badgeGas(vv[9]), badgeGas(vv[10]), badgeGas(vv[11]), badgeGas(vv[12]) };
-  static char prevVal[13][14], prevBadge[13][14];
+    liveData.gasH2, liveData.gasCH4, liveData.gasCO, liveData.gasCO2, liveData.gasO2,
+    liveData.pm25, liveData.pm10, liveData.pm1_0 };
+  const uint8_t dd[16] = {2,0,1,1,1, 0,1,0, 0,0,0,0,1, 1,1,1};
+  const char* nn[16] = {
+    "pH Level","TDS","Water Temp","Level","Turbidity",
+    "UV Index","Air Temp","Humidity",
+    "H2","CH4","CO","CO2","O2",
+    "Fine Dust","Coarse Dust","Ultra Fine"};
+  const char* uu[16] = {
+    "pH","ppm","C","cm","NTU",
+    "idx","C","%",
+    "ppm","ppm","ADC","ppm","%",
+    "µg/m³","µg/m³","µg/m³"};
+  const char* bb[16] = {
+    badgePH(vv[0]),  badgeTDS(vv[1]),  badgeTemp(vv[2]), badgeLevel(vv[3]), badgeTurb(vv[4]),
+    badgeUV(vv[5]),  badgeTemp(vv[6]), badgeHum(vv[7]),
+    badgeH2(vv[8]),  badgeCH4(vv[9]), badgeCO(vv[10]),  badgeCO2(vv[11]), badgeO2(vv[12]),
+    badgePM25(vv[13]), badgePM10(vv[14]), badgePM25(vv[15]) };
+  static char prevVal[16][14], prevBadge[16][14];
 
   // Bagian STATIS (status bar, header, judul seksi, NAMA kotak) digambar SEKALI -> tak kedip
   if (fullDraw) {
@@ -862,22 +984,23 @@ void showHome() {
     tft.drawString(hasLiveData ? "Live" : "Wait", 409, 44, 1);
     tft.setTextDatum(TL_DATUM);
 
-    drawSectionHead(69,  "Water Quality", "5 sensors", TILE_WATER_FG, TILE_WATER_FG);
-    drawSectionHead(159, "Air & Climate", "3 sensors", TILE_AIR_FG,   COLOR_ACCENT_GREEN);
-    drawSectionHead(211, "Gas Sensors",   "5 sensors", TILE_GAS_FG,   TILE_GAS_FG);
+    drawSectionHead(63,  "Water Quality", "5 sensors", TILE_WATER_FG, TILE_WATER_FG);
+    drawSectionHead(128, "Air & Climate", "6 sensors", TILE_AIR_FG,   COLOR_ACCENT_GREEN);
+    drawSectionHead(196, "Gas Sensors",   "5 sensors", TILE_GAS_FG,   TILE_GAS_FG);
     tft.fillRoundRect(210, 300, 60, 5, 2, COLOR_PILL);
 
-    for (int i = 0; i < 13; i++) {
-      uint16_t fg = (i <= 4) ? TILE_WATER_FG : (i <= 7) ? TILE_AIR_FG : TILE_GAS_FG;
+    for (int i = 0; i < 16; i++) {
+      // i=0-4: Water | i=5-7: Air row1 | i=8-12: Gas | i=13-15: Dust (Air row2, warna hijau)
+      uint16_t fg = (i <= 4) ? TILE_WATER_FG : (i <= 7 || i >= 13) ? TILE_AIR_FG : TILE_GAS_FG;
       tileCardStatic(HOME_TX[i], HOME_TY[i], HOME_TW, HOME_TH, nn[i], fg);
-      prevVal[i][0] = '\0'; prevBadge[i][0] = '\0';   // paksa isi angka+badge di bawah
+      prevVal[i][0] = '\0'; prevBadge[i][0] = '\0';
     }
   }
 
-  // DINAMIS: angka & badge -> update HANYA kalau berubah (kartu TIDAK digambar ulang)
-  for (int i = 0; i < 13; i++) {
-    uint16_t bg = (i <= 4) ? TILE_WATER_BG : (i <= 7) ? TILE_AIR_BG : TILE_GAS_BG;
-    uint16_t fg = (i <= 4) ? TILE_WATER_FG : (i <= 7) ? TILE_AIR_FG : TILE_GAS_FG;
+  // DINAMIS: angka & badge -> update HANYA kalau berubah
+  for (int i = 0; i < 16; i++) {
+    uint16_t bg = (i <= 4) ? TILE_WATER_BG : (i <= 7 || i >= 13) ? TILE_AIR_BG : TILE_GAS_BG;
+    uint16_t fg = (i <= 4) ? TILE_WATER_FG : (i <= 7 || i >= 13) ? TILE_AIR_FG : TILE_GAS_FG;
     char vs[14]; fmtVal(vs, vv[i], dd[i]);
     if (strcmp(vs, prevVal[i]) != 0) {
       tileValue(HOME_TX[i], HOME_TY[i], HOME_TW, vs, uu[i]);
@@ -1113,9 +1236,7 @@ void drawLampCard(int idx) {
   tft.fillCircle(icx, icy, 16, on ? COLOR_DARK_GREEN : 0xC618);
   drawBulbIcon(icx, icy, on ? COLOR_TEXT_WHITE : COLOR_TEXT_GRAY);
 
-  // Nama cocok fixture asli di board kontrol: lampu 0=Ring, 1..4=Strip 1..4.
-  // (English — untuk lomba di Jepang.) Tiap kartu = on/off sendiri.
-  static const char* lampLabels[5] = { "Ring Light", "Strip 1", "Strip 2", "Strip 3", "Strip 4" };
+  static const char* lampLabels[4] = { "Strip 1", "Strip 2", "Strip 3", "Strip 4" };
   const char* name = lampLabels[idx];
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(on ? COLOR_TEXT_WHITE : COLOR_DARK_GREEN);
@@ -1158,7 +1279,7 @@ void showLight() {
     }
 
     // Toggle lampu
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 4; i++) {
       int col = i % 3, row = i / 3;
       int gx = 10 + col * 157, gy = 196 + row * 65;
       if (dx >= (uint16_t)gx && dx < (uint16_t)(gx + 146) && touchY >= (uint16_t)gy && touchY < (uint16_t)(gy + 55)) {
@@ -1195,7 +1316,7 @@ void showLight() {
   tft.setTextDatum(TL_DATUM); tft.setTextColor(COLOR_TEXT_GRAY);
   tft.drawString("Lights", 15, 183, 2);
 
-  for (int i = 0; i < 5; i++) drawLampCard(i);
+  for (int i = 0; i < 4; i++) drawLampCard(i);
 
   tft.fillRoundRect(210, 309, 60, 5, 2, COLOR_PILL);
   screenDrawn = true;
@@ -1511,31 +1632,46 @@ void drawChartDetail(int s, bool fullDraw) {
       yMin=30; yMax=90; iconType=1;
       yLabels[0]="30"; yLabels[1]="45"; yLabels[2]="60"; yLabels[3]="75"; yLabels[4]="90";
       curVal=liveData.humidity; break;
-    case 9: // H2
-      title="H2"; subtitle="Hydrogen Gas"; unit="ppm";
-      yMin=0; yMax=1000; iconType=0;
-      yLabels[0]="0"; yLabels[1]="250"; yLabels[2]="500"; yLabels[3]="750"; yLabels[4]="1000";
+    case 9: // H2 — MP-02
+      title="H2"; subtitle="Hydrogen (MP-02)"; unit="ppm";
+      yMin=0; yMax=2000; iconType=0;
+      yLabels[0]="0"; yLabels[1]="500"; yLabels[2]="1000"; yLabels[3]="1500"; yLabels[4]="2000";
       curVal=liveData.gasH2; break;
-    case 10: // CH4
-      title="CH4"; subtitle="Methane Gas"; unit="ppm";
-      yMin=0; yMax=1000; iconType=0;
-      yLabels[0]="0"; yLabels[1]="250"; yLabels[2]="500"; yLabels[3]="750"; yLabels[4]="1000";
+    case 10: // CH4 — MQ-135
+      title="CH4"; subtitle="Methane (MQ-135)"; unit="ppm";
+      yMin=0; yMax=5000; iconType=0;
+      yLabels[0]="0"; yLabels[1]="1250"; yLabels[2]="2500"; yLabels[3]="3750"; yLabels[4]="5000";
       curVal=liveData.gasCH4; break;
-    case 11: // CO
-      title="CO"; subtitle="Carbon Monoxide"; unit="ppm";
+    case 11: // CO — FF sensor
+      title="CO"; subtitle="Carbon Monoxide (FF)"; unit="ADC";
       yMin=0; yMax=4095; iconType=0;
       yLabels[0]="0"; yLabels[1]="1024"; yLabels[2]="2048"; yLabels[3]="3072"; yLabels[4]="4095";
       curVal=liveData.gasCO; break;
-    case 12: // CO2
-      title="CO2"; subtitle="Carbon Dioxide"; unit="ppm";
-      yMin=0; yMax=1000; iconType=0;
-      yLabels[0]="0"; yLabels[1]="250"; yLabels[2]="500"; yLabels[3]="750"; yLabels[4]="1000";
+    case 12: // CO2 — ENS160 eCO2
+      title="CO2"; subtitle="CO2 (ENS160)"; unit="ppm";
+      yMin=400; yMax=3000; iconType=0;
+      yLabels[0]="400"; yLabels[1]="900"; yLabels[2]="1600"; yLabels[3]="2300"; yLabels[4]="3000";
       curVal=liveData.gasCO2; break;
-    default: // 13 = O2
-      title="O2"; subtitle="Oxygen Gas"; unit="ppm";
-      yMin=0; yMax=1000; iconType=0;
-      yLabels[0]="0"; yLabels[1]="250"; yLabels[2]="500"; yLabels[3]="750"; yLabels[4]="1000";
+    case 13: // O2 — MP-02 proxy
+      title="O2"; subtitle="Oxygen % (MP-02)"; unit="%";
+      yMin=5; yMax=25; iconType=0;
+      yLabels[0]="5"; yLabels[1]="10"; yLabels[2]="15"; yLabels[3]="20"; yLabels[4]="25";
       curVal=liveData.gasO2; break;
+    case 14: // Fine Dust PM2.5 — SEN0460
+      title="Fine Dust"; subtitle="PM2.5 (SEN0460)"; unit="ug/m3";
+      yMin=0; yMax=150; iconType=7;
+      yLabels[0]="0"; yLabels[1]="12"; yLabels[2]="55"; yLabels[3]="100"; yLabels[4]="150";
+      curVal=liveData.pm25; break;
+    case 15: // Coarse Dust PM10 — SEN0460
+      title="Coarse Dust"; subtitle="PM10 (SEN0460)"; unit="ug/m3";
+      yMin=0; yMax=354; iconType=7;
+      yLabels[0]="0"; yLabels[1]="54"; yLabels[2]="154"; yLabels[3]="254"; yLabels[4]="354";
+      curVal=liveData.pm10; break;
+    default: // 16 = Ultra Fine Dust PM1.0 — SEN0460
+      title="Ultra Fine"; subtitle="PM1.0 (SEN0460)"; unit="ug/m3";
+      yMin=0; yMax=100; iconType=7;
+      yLabels[0]="0"; yLabels[1]="12"; yLabels[2]="35"; yLabels[3]="65"; yLabels[4]="100";
+      curVal=liveData.pm1_0; break;
   }
 
   // Hitung min/avg/max dari ring buffer
@@ -1547,10 +1683,10 @@ void drawChartDetail(int s, bool fullDraw) {
   }
   trendUp = (chartBuf[s][CHART_POINTS-1] >= chartBuf[s][0]);
 
-  // Desimal per sensor: pH=2; TDS/Humidity/gas=0; lainnya=1
+  // Desimal: pH=2; TDS/Humidity/gas(9-12)=0; O2=1; PM2.5=1; lainnya=1
   uint8_t dec = 1;
   if (s == 1) dec = 2;
-  else if (s == 2 || s == 8 || s >= 9) dec = 0;
+  else if (s == 2 || s == 8 || (s >= 9 && s <= 12)) dec = 0;
 
   char statMin[12], statAvg[12], statMax[12], bigValue[12];
   dtostrf(bMin, -1, dec, statMin);
